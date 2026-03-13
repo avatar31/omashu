@@ -1,0 +1,43 @@
+syntax="proto3";
+import "google/protobuf/descriptor.proto";
+import "google/protobuf/duration.proto";
+
+option go_package = ".;types";
+
+enum CommandType {
+    UNKNOWN = 0;
+    SET = 1;
+    DELETE = 2;
+    DECR_BY = 3;
+    INCR_BY = 4;
+    TRANSACTION = 5;
+    BATCH_WRITE = 6;
+    DELETE_BY_PREFIX = 7;
+    UPDATE = 8;
+}
+
+enum UpdateDeltaType {
+    UNKNOWN_DELTA = 0;
+    JSON = 1;
+    PROTOBUF = 2;
+}
+
+message UpdateMeta {
+    UpdateDeltaType update_delta_type = 1;
+    google.protobuf.FileDescriptorSet message_descriptors = 2;
+    string message_name = 3;
+}
+
+message Command {
+    string id =1; 
+    CommandType type = 2;
+    string key = 3;
+    bytes value = 4;
+    string prefix = 5;
+    uint64 incr_or_decr_delta = 6;
+    google.protobuf.Duration ttl = 7;
+    uint64 read_ts = 8;
+    uint64 commit_ts = 9;
+    UpdateMeta update_meta = 10;
+    repeated Command sub_commands = 11;
+}
