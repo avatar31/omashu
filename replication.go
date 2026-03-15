@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -19,8 +21,6 @@ const (
 )
 
 type Replicator interface {
-	GetLatestSnapshot(ctx context.Context) (string, error)
-	ListSnapshots(ctx context.Context) ([]string, error)
 	TakeSnapshot(ctx context.Context, generation uint64) (uint64, string, error)
 	ReadSnapshotContent(ctx context.Context, snapName string) ([]byte, error)
 	DeleteSnapshot(ctx context.Context, snapName string) error
@@ -28,7 +28,6 @@ type Replicator interface {
 }
 
 type Replicate struct {
-	Path string
 	db   *BadgerDB
 	log  *zap.Logger
 }
@@ -48,7 +47,7 @@ func NewReplicator(db Database, log *zap.Logger) (Replicator, error) {
 }
 
 func (r *Replicate) TakeSnapshot(ctx context.Context, generation uint64) (uint64, string, error) {
-	snapName := time.Now().UTC().Format(SNAPSHOT_DIR_FORMAT) + ".bak"
+	snapName := fmt.Sprintf("%s.bak", time.Now().UTC().Format(SNAPSHOT_DIR_FORMAT))
 	file, err := os.Create(r.getSnapPath(snapName))
 	if err != nil {
 		return 0, "", err
@@ -72,7 +71,7 @@ func (r *Replicate) ReadSnapshotContent(ctx context.Context, snapName string) ([
 	}
 
 	snapshotData := make([]byte, stat.Size())
-	_, err = file.Read(snapshotData)
+	_, err = io.ReadFull(file, snapshotData) // Ensure we read the entire file
 	if err != nil {
 		return nil, err
 	}
@@ -86,14 +85,6 @@ func (r *Replicate) DeleteSnapshot(ctx context.Context, snapName string) error {
 
 func (r *Replicate) getSnapPath(snapName string) string {
 	return filepath.Join(r.db.Path, SNAPSHOT_DIR, snapName)
-}
-
-func (r *Replicate) GetLatestSnapshot(ctx context.Context) (string, error) {
-	return "", nil
-}
-
-func (r *Replicate) ListSnapshots(ctx context.Context) ([]string, error) {
-	return []string{}, nil
 }
 
 func (r *Replicate) Restore(ctx context.Context, data []byte) error {

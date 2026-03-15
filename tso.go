@@ -100,7 +100,7 @@ type TSO struct {
 	mu  sync.Mutex
 }
 
-func NewTSO(ctx context.Context, db *DBStore, logger *zap.Logger) (*TSO, error) {
+func newTSO(ctx context.Context, db *DBStore, logger *zap.Logger) (*TSO, error) {
 	tso := &TSO{
 		current: newEmptyTimeStamp(),
 		saved:   newEmptyTimeStamp(),
