@@ -119,7 +119,7 @@ func (txn *Txn) IncrBy(ctx context.Context, key string, delta uint64) error {
 		return err
 	}
 
-	txn.cmd.AddSubCommand(types.NewIncrByCommand(ctx, persistentKey, delta))
+	txn.cmd.AddSubCommand(types.NewIncrByCommand(ctx, key, delta))
 	return nil
 }
 
@@ -129,7 +129,7 @@ func (txn *Txn) DecrBy(ctx context.Context, key string, delta uint64) error {
 		return err
 	}
 
-	txn.cmd.AddSubCommand(types.NewDecrByCommand(ctx, persistentKey, delta))
+	txn.cmd.AddSubCommand(types.NewDecrByCommand(ctx, key, delta))
 	return nil
 }
 

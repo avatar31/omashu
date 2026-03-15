@@ -44,15 +44,20 @@ type Node struct {
 	confStateMu sync.RWMutex
 
 	appliedIndex atomic.Uint64
+	lead         atomic.Uint64
+	selfRemoved  atomic.Bool
 	// committedIndex atomic.Uint64
 	// term           atomic.Uint64
-	lead atomic.Uint64
 
 	confChangeNotifier chan raftpb.ConfChange
 	proposeNotifier    chan []byte
 	stopNotifier       chan struct{}
 	readStatesNotifier chan raft.ReadState
 	respNotifier       chan ProposeResp
+
+	// callbacks
+	OnLeaderChange func(newLeader uint64)
+	OnRemovedSelf  func()
 
 	mu  sync.RWMutex
 	log *zap.Logger
@@ -159,22 +164,37 @@ func (node *Node) run(ctx context.Context) {
 	for {
 		select {
 		case <-ticker.C:
-			// TODO: P0: etcd tick within mutex. Need to investigate why..
 			node.n.Tick()
 		case prop := <-node.proposeNotifier:
 			c, _ := types.DecodeCommand(prop)
+			if node.getSelfRemoved() {
+				node.log.Warn("Node has been removed from cluster. Not processing any new requests.")
+				node.respNotifier <- ProposeResp{CmdID: c.Id, Err: errors.New("node has been removed from cluster")}
+				continue
+			}
+
 			err := node.n.Propose(ctx, prop)
 			if err != nil {
 				node.log.Error("Failed to propose entry", zap.Error(err), zap.String("cmdID", c.Id))
 			}
 			node.respNotifier <- ProposeResp{CmdID: c.Id, Err: err}
 		case cc := <-node.confChangeNotifier:
+			if node.getSelfRemoved() {
+				node.log.Warn("Node has been removed from cluster. Not processing any new requests.")
+				continue
+			}
+
 			err := node.n.ProposeConfChange(ctx, cc)
 			if err != nil {
 				node.log.Error("Failed to propose conf change. Stopping raft node.", zap.Error(err))
 				return
 			}
 		case rd := <-node.n.Ready():
+			if node.getSelfRemoved() {
+				node.log.Warn("Node has been removed from cluster. Not processing any new requests.")
+				continue
+			}
+
 			if err := node.processReady(ctx, &rd); err != nil {
 				node.log.Error("Failed to process ready. Stopping raft node.", zap.Error(err))
 				return
@@ -200,7 +220,7 @@ func (node *Node) processReady(ctx context.Context, rd *raft.Ready) error {
 	// node.setTerm(rd.Term)
 	if rd.SoftState != nil {
 		node.log.Info("Soft state changed", zap.String("softState", raft.DescribeSoftState(*rd.SoftState)))
-		node.setLead(rd.SoftState.Lead)
+		node.handleLeaderChange(rd.SoftState.Lead)
 	}
 
 	pendingReadStates := make([]raft.ReadState, 0)
@@ -230,7 +250,7 @@ func (node *Node) processReady(ctx context.Context, rd *raft.Ready) error {
 			return err
 		}
 		if selfRemove {
-			node.log.Info("I've been removed from the cluster! Shutting down.")
+			node.scheduleSelfRemoval()
 			return nil
 		}
 	}
@@ -251,6 +271,31 @@ func (node *Node) processReady(ctx context.Context, rd *raft.Ready) error {
 	go node.takeSnapshotIfNeeded(ctx, false)
 	node.n.Advance()
 	return nil
+}
+
+func (node *Node) scheduleSelfRemoval() {
+	node.log.Info("I've been removed from the cluster! Shutting down.")
+	node.setSelfRemoved(true)
+
+	// Give a small grace period to finish outstanding work
+	time.Sleep(1 * time.Second)
+	if node.OnRemovedSelf != nil {
+		node.OnRemovedSelf()
+	}
+
+	node.stopNotifier <- struct{}{}
+}
+
+func (node *Node) handleLeaderChange(newLeader uint64) {
+	// Update local state and invoke hook. Avoid repeating if unchanged.
+	if newLeader == node.getLead() {
+		return
+	}
+
+	node.setLead(newLeader)
+	if node.OnLeaderChange != nil {
+		node.OnLeaderChange(newLeader)
+	}
 }
 
 func (node *Node) respondToReadStates(readStates []raft.ReadState) []raft.ReadState {
@@ -362,13 +407,19 @@ func (node *Node) applyEntries(ctx context.Context, entries []raftpb.Entry) (boo
 		case raftpb.EntryNormal:
 			if len(entries[i].Data) != 0 {
 				publishedEntries++
-				node.applyNormalEntry(ctx, &entries[i])
+				if err := node.applyNormalEntry(ctx, entries[i]); err != nil {
+					return selfRemove, err
+				}
 			}
 		case raftpb.EntryConfChange:
 			publishedEntries++
-			selfRemove = node.applyConfChange(ctx, &entries[i])
+			var err error
+			selfRemove, err = node.applyConfChange(ctx, entries[i])
+			if err != nil {
+				return selfRemove, err
+			}
 		default:
-			return false, fmt.Errorf("unknown entry type: %v", entries[i].Type.String())
+			return selfRemove, fmt.Errorf("unknown entry type: %v", entries[i].Type.String())
 		}
 	}
 
@@ -377,43 +428,52 @@ func (node *Node) applyEntries(ctx context.Context, entries []raftpb.Entry) (boo
 	return selfRemove, nil
 }
 
-func (node *Node) applyNormalEntry(ctx context.Context, entry *raftpb.Entry) {
+func (node *Node) applyNormalEntry(ctx context.Context, entry raftpb.Entry) error {
 	appliedIndex := node.getAppliedIndex()
 	if entry.Index <= appliedIndex {
 		node.log.Warn("Skipping already applied entry", zap.Uint64("index", entry.Index),
 			zap.Uint64("appliedIndex", appliedIndex))
-		return
+		return nil
 	}
 
 	if err := node.fsm.Apply(ctx, entry.Data); err != nil {
 		node.log.Error("Failed to apply normal entry to FSM", zap.Uint64("index", entry.Index), zap.Error(err))
-		// TODO: How to handle this error?
+		return err
 	}
+	return nil
 }
 
-func (node *Node) applyConfChange(ctx context.Context, entry *raftpb.Entry) bool {
+func (node *Node) applyConfChange(ctx context.Context, entry raftpb.Entry) (bool, error) {
 	var cc raftpb.ConfChange
-	cc.Unmarshal(entry.Data)
+	if err := cc.Unmarshal(entry.Data); err != nil {
+		node.log.Error("Failed to unmarshal conf change entry", zap.Uint64("index", entry.Index), zap.Error(err))
+		return false, err
+	}
+
+	// Apply to raft internal state (required)
+	// Note: Node.ApplyConfChange returns the new ConfState. We need to update our local confState with it.
 	confState := node.n.ApplyConfChange(cc)
 	node.setConfState(*confState)
 
 	switch cc.Type {
-	case raftpb.ConfChangeAddNode: // TODO: Do we need raftpb.ConfChangeAddLearnerNode?
+	case raftpb.ConfChangeAddNode, raftpb.ConfChangeAddLearnerNode:
 		if len(cc.Context) > 0 {
-			// node.transport.AddPeer(ctx, cc.NodeID, string(cc.Context))
+			node.transport.AddPeer(ctx, cc.NodeID, string(cc.Context))
 		}
 	case raftpb.ConfChangeRemoveNode:
 		if cc.NodeID == node.id {
-			return true
+			return true, nil
 		}
 		node.transport.RemovePeer(ctx, cc.NodeID)
 	case raftpb.ConfChangeUpdateNode:
-		// TODO: Handle update node if needed
+		if len(cc.Context) > 0 {
+			node.transport.UpdatePeer(ctx, cc.NodeID, string(cc.Context))
+		}
 	}
 
-	node.log.Info("Applied configuration change", zap.String("entry", raft.DescribeEntry(*entry, nil)),
+	node.log.Info("Applied configuration change", zap.String("entry", raft.DescribeEntry(entry, nil)),
 		zap.String("newConfState", raft.DescribeConfState(node.getConfState())))
-	return false
+	return false, nil
 }
 
 func (node *Node) takeSnapshotIfNeeded(ctx context.Context, force bool) {
@@ -514,7 +574,7 @@ func (node *Node) getAppliedIndex() uint64 {
 // }
 
 func (node *Node) setLead(v uint64) {
-	node.log.Debug("Setting Lead", //zap.Stack("stack"),	// TODO: Remove debug log before production
+	node.log.Debug("Setting Lead",
 		zap.Uint64("oldLead", node.getLead()), zap.Uint64("newLead", v))
 	node.lead.Store(v)
 }
@@ -523,9 +583,19 @@ func (node *Node) getLead() uint64 {
 	return node.lead.Load()
 }
 
+func (node *Node) setSelfRemoved(v bool) {
+	node.log.Debug("Setting selfRemoved",
+		zap.Bool("oldValue", node.selfRemoved.Load()), zap.Bool("newValue", v))
+	node.selfRemoved.Store(v)
+}
+
+func (node *Node) getSelfRemoved() bool {
+	return node.selfRemoved.Load()
+}
+
 func (node *Node) setConfState(confState raftpb.ConfState) {
 	node.confStateMu.Lock()
-	node.log.Debug("Setting ConfState", //zap.Stack("stack"),	// TODO: Remove debug log before production
+	node.log.Debug("Setting ConfState",
 		zap.String("oldConfState", raft.DescribeConfState(node.confState)),
 		zap.String("newConfState", raft.DescribeConfState(confState)))
 	node.confState = confState

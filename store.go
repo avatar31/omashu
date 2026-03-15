@@ -10,7 +10,6 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/avatar31/omashu/db"
 	"github.com/avatar31/omashu/types"
 )
 
@@ -106,7 +105,7 @@ func InitDBStore(ctx context.Context, id uint64, nodename string, peers map[uint
 		// Init DB
 		// clusterMode := config.GetConfig().Mode == config.MODE_CLUSTER
 		clusterMode := false
-		err := db.InitDB(ctx, clusterMode, log)
+		err := InitDB(ctx, clusterMode, log)
 		if err != nil {
 			log.Panic("Failed to open application DB", zap.Error(err))
 		}
@@ -115,20 +114,19 @@ func InitDBStore(ctx context.Context, id uint64, nodename string, peers map[uint
 			return
 		}
 
-		bdb := db.GetDB(ctx)
-
+		bdb := GetDB(ctx)
 		fsm := NewFSM(bdb, log)
 
 		// Init Raft Node
 		node, err := NewNode(ctx, id, nodename, peers, fsm, log)
 		if err != nil {
-			db.Close(ctx, log)
+			DbClose(ctx, log)
 			log.Panic("Failed to create raft node", zap.Error(err))
 		}
 
 		err = node.Start(ctx)
 		if err != nil {
-			db.Close(ctx, log)
+			DbClose(ctx, log)
 			log.Panic("Failed to start raft node", zap.Error(err))
 		}
 
@@ -144,7 +142,7 @@ func InitDBStore(ctx context.Context, id uint64, nodename string, peers map[uint
 			tso, err := NewTSO(ctx, dbstoreInstance, log)
 			if err != nil {
 				node.Stop(ctx)
-				db.Close(ctx, log)
+				DbClose(ctx, log)
 				log.Panic("Failed to create TSO", zap.Error(err))
 			}
 
@@ -379,8 +377,8 @@ func (s *DBStore) BatchWrite(ctx context.Context, addSubCommands func(*types.Com
 		return nil
 	}
 
-	if len(cmd.SubCommands) > db.MaxBatchSize {
-		return db.ErrBatchTooBig
+	if len(cmd.SubCommands) > MaxBatchSize {
+		return ErrBatchTooBig
 	}
 
 	// Getting readTs and commitTs for batch to find conflicts
@@ -493,7 +491,7 @@ func (s *DBStore) Close(ctx context.Context) {
 		s.node.Stop(ctx)
 	}
 
-	db.Close(ctx, s.log)
+	DbClose(ctx, s.log)
 
 	// err := s.log.Sync()
 	// if err != nil {

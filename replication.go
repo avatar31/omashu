@@ -1,4 +1,4 @@
-package db
+package omashu
 
 import (
 	"bytes"
@@ -30,10 +30,10 @@ type Replicator interface {
 type Replicate struct {
 	Path string
 	db   *BadgerDB
-	log  zap.Logger
+	log  *zap.Logger
 }
 
-func NewReplicator(db Database) (Replicator, error) {
+func NewReplicator(db Database, log *zap.Logger) (Replicator, error) {
 	bdb, ok := db.(*BadgerDB)
 	if !ok {
 		return nil, errors.New("invalid db instance")
@@ -44,7 +44,7 @@ func NewReplicator(db Database) (Replicator, error) {
 		return nil, err
 	}
 
-	return &Replicate{db: bdb}, nil
+	return &Replicate{db: bdb, log: log}, nil
 }
 
 func (r *Replicate) TakeSnapshot(ctx context.Context, generation uint64) (uint64, string, error) {
