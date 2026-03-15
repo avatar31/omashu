@@ -18,3 +18,8 @@
 ### Doubts
 - What's CockroachDB’s lease-based reads
 - What are raft groups to keep multiple leaders
+
+
+### Performance
+go test -bench .
+go build -gcflags="-m"

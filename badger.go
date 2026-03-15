@@ -1,4 +1,4 @@
-package db
+package omashu
 
 import (
 	"context"
@@ -68,7 +68,7 @@ const (
 )
 
 var (
-	once     sync.Once
+	dbonce     sync.Once
 	instance *BadgerDB
 
 	// ErrBatchTooBig indicates that the batch size exceeds the maximum limit.
@@ -82,7 +82,7 @@ func InitDB(ctx context.Context, managed bool, log *zap.Logger) error {
 	// dbPath := filepath.Join(config.GetConfig().MetaDataPath, "metadb")
 	dbPath := ""
 	var err error
-	once.Do(func() {
+	dbonce.Do(func() {
 		log.Info("Initializing DB")
 
 		opts := badger.DefaultOptions(filepath.Join(dbPath, "application")).
@@ -592,7 +592,7 @@ func (bdb *BadgerDB) DeleteByPrefixWithTxn(ctx context.Context, txn *badger.Txn,
 		key := string(item.KeyCopy(nil))
 		err := bdb.DeleteWithTxn(ctx, txn, key)
 		if err != nil && err != badger.ErrKeyNotFound {
-			bdb.log.Error("Error while deleting data in database", zap.String("key", key), zap.Error(err))
+			bdb.log.Warn("Error while deleting data in database", zap.String("key", key), zap.Error(err))
 			continue
 		}
 	}
@@ -911,7 +911,7 @@ func (bdb *BadgerDB) runGC(ctx context.Context, lastSz *int64) {
 // 	log.Info("Stopped DB publisher subscription")
 // }
 
-func Close(ctx context.Context, log *zap.Logger) {
+func DbClose(ctx context.Context, log *zap.Logger) {
 	if instance != nil {
 		log.Info("Closing DB connection")
 		if err := instance.DB.Close(); err != nil {

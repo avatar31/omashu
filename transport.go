@@ -21,13 +21,14 @@ const (
 )
 
 type Transport struct {
-	id uint64
-	peers  map[uint64]string // nodeID -> address
+	id     uint64
 	raftTr *rafthttp.Transport
 	server *http.Server
 
+	mu    sync.Mutex
+	peers map[uint64]string // nodeID -> address
+
 	httpstopc chan struct{}
-	mu        sync.RWMutex
 	log       *zap.Logger
 }
 
@@ -46,7 +47,7 @@ func (tr *Transport) Start(ctx context.Context, node *Node, snapshotter *snap.Sn
 		ClusterID:   0x1000, // TODO: P1: Do we need a real cluster ID here?
 		Raft:        node,
 		ErrorC:      errorC,
-		// Logger:      tr.log, //TODO: P0: Fix me
+		Logger:      tr.log, //TODO: P0: Fix me
 		ServerStats: stats.NewServerStats("", ""),
 		LeaderStats: stats.NewLeaderStats(tr.log, fmt.Sprintf("%d", tr.id)),
 		Snapshotter: snapshotter, // TODO: Why do we need this?
@@ -115,6 +116,14 @@ func (tr *Transport) RemovePeer(ctx context.Context, id uint64) {
 	delete(tr.peers, id)
 	tr.mu.Unlock()
 	tr.log.Info(fmt.Sprintf("Removed peer %d", id))
+}
+
+func (tr *Transport) UpdatePeer(ctx context.Context, id uint64, addr string) {
+	tr.raftTr.UpdatePeer(etcdtypes.ID(id), []string{addr})
+	tr.mu.Lock()
+	tr.peers[id] = addr
+	tr.mu.Unlock()
+	tr.log.Info(fmt.Sprintf("Updated peer %d with new address %s", id, addr))
 }
 
 func (tr *Transport) Stop() error {

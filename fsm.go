@@ -9,20 +9,19 @@ import (
 	"go.etcd.io/raft/v3/raftpb"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
-	
-	"github.com/avatar31/omashu/db"
+
 	"github.com/avatar31/omashu/types"
 )
 
 type FSM struct {
-	db  db.Database
+	db  Database
 	tso *TSO
 
 	mu  sync.RWMutex
 	log *zap.Logger
 }
 
-func NewFSM(database db.Database, logger *zap.Logger) *FSM {
+func NewFSM(database Database, logger *zap.Logger) *FSM {
 	return &FSM{
 		db:  database,
 		log: logger,
@@ -64,7 +63,7 @@ func (fsm *FSM) Apply(ctx context.Context, data []byte) error {
 		applyErr = fsm.applyTransaction(ctx, c)
 	default:
 		fsm.log.Error("Unknown command type", zap.String("command", c.Type.String()))
-		applyErr = db.ErrUnknownOp
+		applyErr = ErrUnknownOp
 	}
 
 	return applyErr
@@ -114,7 +113,7 @@ func (fsm *FSM) applyUpdate(ctx context.Context, cmd *types.Command) error {
 		default:
 			fsm.log.Error("Unknown merge delta type:", zap.String("deltaMergeType",
 				cmd.UpdateMeta.UpdateDeltaType.String()))
-			return db.ErrUnknownOp
+			return ErrUnknownOp
 		}
 
 		return nil
@@ -129,7 +128,8 @@ func (fsm *FSM) applyDelete(ctx context.Context, cmd *types.Command) error {
 
 func (fsm *FSM) applyDeleteByPrefix(ctx context.Context, cmd *types.Command) error {
 	return fsm.db.NewTransactionAt(ctx, cmd.ReadTs, cmd.CommitTs, func(ctx context.Context, txn *badger.Txn) error {
-		return fsm.db.DeleteWithTxn(ctx, txn, cmd.Prefix)
+		fsm.db.DeleteByPrefixWithTxn(ctx, txn, cmd.Prefix)
+		return nil
 	})
 }
 
@@ -198,7 +198,7 @@ func (fsm *FSM) applyTransaction(ctx context.Context, cmd *types.Command) error 
 				default:
 					fsm.log.Error("Unknown merge delta type:", zap.String("deltaMergeType",
 						subCmd.UpdateMeta.UpdateDeltaType.String()))
-					return db.ErrUnknownOp
+					return ErrUnknownOp
 				}
 			case types.CommandType_DELETE:
 				err := fsm.db.DeleteWithTxn(ctx, txn, subCmd.Key)
@@ -216,14 +216,14 @@ func (fsm *FSM) applyTransaction(ctx context.Context, cmd *types.Command) error 
 					return err
 				}
 			default:
-				return db.ErrUnknownOp
+				return ErrUnknownOp
 			}
 		}
 		return nil
 	})
 }
 
-func (fsm *FSM) GetDB() db.Database {
+func (fsm *FSM) GetDB() Database {
 	return fsm.db
 }
 
@@ -231,7 +231,7 @@ func (fsm *FSM) RestoreSnapshot(ctx context.Context, snapshot raftpb.Snapshot) e
 	fsm.mu.Lock()
 	defer fsm.mu.Unlock()
 
-	replicator, err := db.NewReplicator(fsm.db)
+	replicator, err := NewReplicator(fsm.db, fsm.log)
 	if err != nil {
 		fsm.log.Error("Failed to create DB replicator", zap.Error(err))
 		return err
@@ -252,7 +252,7 @@ func (fsm *FSM) CreateSnapshot(ctx context.Context) (uint64, []byte, error) {
 		fsm.log.Panic("TSO is not set in FSM")
 	}
 
-	replicator, err := db.NewReplicator(fsm.db)
+	replicator, err := NewReplicator(fsm.db, fsm.log)
 	if err != nil {
 		return 0, nil, err
 	}
