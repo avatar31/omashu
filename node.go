@@ -39,6 +39,7 @@ type Node struct {
 	storage   *Storage
 	transport *Transport
 	fsm       *FSM
+	cluster Cluster
 
 	confState   raftpb.ConfState
 	confStateMu sync.RWMutex
@@ -56,18 +57,17 @@ type Node struct {
 	respNotifier       chan ProposeResp
 
 	// callbacks
-	OnLeaderChange func(newLeader uint64)
-	OnRemovedSelf  func()
+	onLeaderChange func(newLeader uint64)
+	onRemovedSelf  func()
 
 	mu  sync.RWMutex
 	log *zap.Logger
 }
 
-func NewNode(ctx context.Context, id uint64, nodeName string, peers map[uint64]string, fsm *FSM,
-	logger *zap.Logger) (*Node, error) {
+func newNode(id uint64, nodename string, peers map[uint64]string, fsm *FSM, log *zap.Logger) (*Node, error) {
 	node := &Node{
 		id:                 id,
-		name:               nodeName,
+		name:               nodename,
 		peers:              peers,
 		fsm:                fsm,
 		confChangeNotifier: make(chan raftpb.ConfChange),
@@ -75,14 +75,15 @@ func NewNode(ctx context.Context, id uint64, nodeName string, peers map[uint64]s
 		stopNotifier:       make(chan struct{}),
 		readStatesNotifier: make(chan raft.ReadState, 2),
 		respNotifier:       make(chan ProposeResp, 1),
-		log:                logger,
+		log:                log,
 	}
 
 	return node, nil
 }
 
-func (node *Node) Start(ctx context.Context) error {
-	storage, err := NewStorage(node.log)
+func (node *Node) Start(ctx context.Context, cfg *Config) error {
+	node.cluster = cfg.Cluster
+	storage, err := newStorage(cfg.BaseDir, node.log)
 	if err != nil {
 		return err
 	}
@@ -98,18 +99,23 @@ func (node *Node) Start(ctx context.Context) error {
 		peers = append(peers, raft.Peer{ID: id})
 	}
 
-	// raft.SetLogger(logger.GetLogger(ctx))
+	raft.SetLogger(newLogger("omashu.raft", cfg.Logger))
 	raftConf := &raft.Config{
-		ID:                        node.id,
-		ElectionTick:              10, // 1s
-		HeartbeatTick:             1,  // 100ms
-		Storage:                   node.storage,
-		MaxSizePerMsg:             1024 * 1024, // 1 MB		// TODO: P0: Tune this value
-		MaxInflightMsgs:           256,         // TODO: P0: Tune this value
-		CheckQuorum:               true,
-		PreVote:                   true,
-		DisableProposalForwarding: true,    // rest middleware will take care of forwarding
-		MaxUncommittedEntriesSize: 1 << 30, // 1GB			// TODO: P0: Tune this value
+		ID:                          cfg.RaftConfig.ID,
+		ElectionTick:                cfg.RaftConfig.ElectionTick,
+		HeartbeatTick:               cfg.RaftConfig.HeartbeatTick,
+		Storage:                     node.storage,
+		MaxSizePerMsg:               cfg.RaftConfig.MaxSizePerMsg,
+		MaxCommittedSizePerReady:    cfg.RaftConfig.MaxCommittedSizePerReady,
+		MaxUncommittedEntriesSize:   cfg.RaftConfig.MaxUncommittedEntriesSize,
+		MaxInflightMsgs:             cfg.RaftConfig.MaxInflightMsgs,
+		MaxInflightBytes:            cfg.RaftConfig.MaxInflightBytes,
+		CheckQuorum:                 cfg.RaftConfig.CheckQuorum,
+		PreVote:                     cfg.RaftConfig.PreVote,
+		ReadOnlyOption:              cfg.RaftConfig.ReadOnlyOption,
+		DisableProposalForwarding:   cfg.RaftConfig.DisableProposalForwarding,
+		DisableConfChangeValidation: cfg.RaftConfig.DisableConfChangeValidation,
+		StepDownOnRemoval:           cfg.RaftConfig.StepDownOnRemoval,
 	}
 
 	if node.storage.Existing() {
@@ -122,7 +128,7 @@ func (node *Node) Start(ctx context.Context) error {
 
 	errCh := make(chan error)
 	node.transport = NewTransport(node.id, node.peers, node.log)
-	node.transport.Start(ctx, node, storage.wal.snapshotter, errCh)
+	node.transport.Start(ctx, node.cluster, node, storage.wal.snapshotter, errCh)
 
 	go node.run(ctx)
 
@@ -279,8 +285,8 @@ func (node *Node) scheduleSelfRemoval() {
 
 	// Give a small grace period to finish outstanding work
 	time.Sleep(1 * time.Second)
-	if node.OnRemovedSelf != nil {
-		node.OnRemovedSelf()
+	if node.onRemovedSelf != nil {
+		node.onRemovedSelf()
 	}
 
 	node.stopNotifier <- struct{}{}
@@ -293,8 +299,8 @@ func (node *Node) handleLeaderChange(newLeader uint64) {
 	}
 
 	node.setLead(newLeader)
-	if node.OnLeaderChange != nil {
-		node.OnLeaderChange(newLeader)
+	if node.onLeaderChange != nil {
+		node.onLeaderChange(newLeader)
 	}
 }
 
@@ -630,7 +636,7 @@ func (node *Node) Process(ctx context.Context, m raftpb.Message) error {
 }
 
 func (node *Node) IsIDRemoved(id uint64) bool {
-	return false // TODO: Implement this
+	return node.cluster.IsNodeRemoved(id)
 }
 
 func (node *Node) ReportUnreachable(id uint64) {

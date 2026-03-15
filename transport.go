@@ -32,19 +32,19 @@ type Transport struct {
 	log       *zap.Logger
 }
 
-func NewTransport(id uint64, peers map[uint64]string, logger *zap.Logger) *Transport {
+func NewTransport(id uint64, peers map[uint64]string, log *zap.Logger) *Transport {
 	return &Transport{
 		id:        id,
 		peers:     peers,
-		log:       logger,
+		log:       log,
 		httpstopc: make(chan struct{}),
 	}
 }
 
-func (tr *Transport) Start(ctx context.Context, node *Node, snapshotter *snap.Snapshotter, errorC chan error) {
+func (tr *Transport) Start(ctx context.Context, cluster Cluster, node *Node, snapshotter *snap.Snapshotter, errorC chan error) {
 	tr.raftTr = &rafthttp.Transport{
 		ID:          etcdtypes.ID(tr.id),
-		ClusterID:   0x1000, // TODO: P1: Do we need a real cluster ID here?
+		ClusterID:   etcdtypes.ID(cluster.GetClusterID()),
 		Raft:        node,
 		ErrorC:      errorC,
 		Logger:      tr.log, //TODO: P0: Fix me

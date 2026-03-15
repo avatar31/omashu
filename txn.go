@@ -10,17 +10,16 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
-	
-	"github.com/avatar31/omashu/db"
+
 	"github.com/avatar31/omashu/types"
 )
 
 type TxnManager struct {
-	db *DBStore
+	db  *DBStore
 	log *zap.Logger
 }
 
-func NewTxnManager(db *DBStore, logger *zap.Logger) *TxnManager {
+func newTxnManager(db *DBStore, logger *zap.Logger) *TxnManager {
 	return &TxnManager{db: db, log: logger}
 }
 
@@ -78,8 +77,8 @@ func (txn *Txn) Commit() (*types.Command, error) {
 		return nil, nil
 	}
 
-	if len(txn.cmd.SubCommands) > db.MaxBatchSize {
-		return nil, db.ErrBatchTooBig
+	if len(txn.cmd.SubCommands) > MaxBatchSize {
+		return nil, ErrBatchTooBig
 	}
 
 	orc := txn.db.tso

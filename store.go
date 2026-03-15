@@ -81,6 +81,7 @@ import (
 type DBStore struct {
 	proposals sync.Map
 
+	db   Database
 	fsm  *FSM
 	node *Node
 	tso  *TSO
@@ -90,77 +91,60 @@ type DBStore struct {
 
 const (
 	DefaultProposeTimeout = 5 * time.Second
+
+	// Subdirectories for different components of the store
+	DBSubDir   = "db"
+	WALSubDir  = "wal"
+	SnapSubDir = "snap"
 )
 
-var (
-	dbstoreInstance *DBStore
-	once            sync.Once
-
-	ErrNotLeader      = errors.New("operation can only be performed on leader node")
-	ErrProposeTimeout = errors.New("raft propose timeout")
-)
-
-func InitDBStore(ctx context.Context, id uint64, nodename string, peers map[uint64]string, log *zap.Logger) {
-	once.Do(func() {
-		// Init DB
-		// clusterMode := config.GetConfig().Mode == config.MODE_CLUSTER
-		clusterMode := false
-		err := InitDB(ctx, clusterMode, log)
-		if err != nil {
-			log.Panic("Failed to open application DB", zap.Error(err))
-		}
-
-		if !clusterMode {
-			return
-		}
-
-		bdb := GetDB(ctx)
-		fsm := NewFSM(bdb, log)
-
-		// Init Raft Node
-		node, err := NewNode(ctx, id, nodename, peers, fsm, log)
-		if err != nil {
-			DbClose(ctx, log)
-			log.Panic("Failed to create raft node", zap.Error(err))
-		}
-
-		err = node.Start(ctx)
-		if err != nil {
-			DbClose(ctx, log)
-			log.Panic("Failed to start raft node", zap.Error(err))
-		}
-
-		dbstoreInstance = &DBStore{
-			fsm:  fsm,
-			node: node,
-			log:  log,
-		}
-
-		if dbstoreInstance.IsLeader() {
-			dbstoreInstance.log.Info("Initializing TSO and TxnManager in Raft Leader node")
-
-			tso, err := NewTSO(ctx, dbstoreInstance, log)
-			if err != nil {
-				node.Stop(ctx)
-				DbClose(ctx, log)
-				log.Panic("Failed to create TSO", zap.Error(err))
-			}
-
-			dbstoreInstance.tso = tso
-			dbstoreInstance.fsm.SetTSO(tso)
-			dbstoreInstance.tm = NewTxnManager(dbstoreInstance, log)
-
-			go dbstoreInstance.listenProposeResponses(ctx)
-		}
-	})
-
-	if dbstoreInstance == nil {
-		log.Panic("Unknown error in initializing DB store instance")
+func Init(ctx context.Context, cfg *Config) (*DBStore, error) {
+	if err := cfg.validate(); err != nil {
+		return nil, err
 	}
-}
 
-func GetDBStore(ctx context.Context) *DBStore {
-	return dbstoreInstance
+	cfg.initializeLog()
+	store := &DBStore{log: cfg.Logger.With(zap.String("module", "omashu"))}
+
+	db, err := initBadger(ctx, cfg, store.log)
+	if err != nil {
+		return nil, err
+	}
+
+	store.db = db
+	store.fsm = newFSM(db, store.log)
+
+	// Init Raft Node
+	node, err := newNode(cfg.RaftConfig.ID, cfg.RaftConfig.Nodename, cfg.RaftConfig.Peers, store.fsm, store.log)
+	if err != nil {
+		store.Close(ctx)
+		return nil, err
+	}
+
+	err = node.Start(ctx, cfg)
+	if err != nil {
+		store.Close(ctx)
+		return nil, err
+	}
+
+	store.node = node
+	if store.IsLeader() {
+		store.log.Info("Initializing TSO and TxnManager in Raft Leader node")
+
+		tso, err := newTSO(ctx, store, store.log)
+		if err != nil {
+			store.Close(ctx)
+			return nil, err
+		}
+
+		store.tso = tso
+		store.fsm.SetTSO(tso)
+		store.tm = newTxnManager(store, store.log)
+
+		go store.listenProposeResponses(ctx)
+	}
+
+	return store, nil
 }
 
 // IsLeader returns true if this node is the leader
@@ -491,10 +475,7 @@ func (s *DBStore) Close(ctx context.Context) {
 		s.node.Stop(ctx)
 	}
 
-	DbClose(ctx, s.log)
-
-	// err := s.log.Sync()
-	// if err != nil {
-	// 	logger.GetLogger(ctx).WithError(err).Error("Error while syncing raft zap logs")
-	// }
+	if s.db != nil {
+		s.db.Close(ctx)
+	}
 }

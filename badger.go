@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"maps"
-	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -54,73 +52,44 @@ type Database interface {
 	UpdateJsonWithTxn(ctx context.Context, txn *badger.Txn, key string, delta map[string]any, ttl ...time.Duration) error
 	UpdateProtobuf(ctx context.Context, key string, delta proto.Message, ttl ...time.Duration) error
 	UpdateProtobufWithTxn(ctx context.Context, txn *badger.Txn, key string, delta proto.Message, ttl ...time.Duration) error
+	Close(ctx context.Context)
 }
 
 type BadgerDB struct {
 	managed bool
 	Path    string
 	DB      *badger.DB
-	log 	*zap.Logger
+	log     *zap.Logger
 }
 
 const (
 	MaxBatchSize = 1000
 )
 
-var (
-	dbonce     sync.Once
-	instance *BadgerDB
-
-	// ErrBatchTooBig indicates that the batch size exceeds the maximum limit.
-	ErrBatchTooBig = errors.New("Batch size exceeds maximum limit")
-
-	// ErrUnknownOp indicates that an unknown operation was encountered.
-	ErrUnknownOp = errors.New("Unknown operation")
-)
-
-func InitDB(ctx context.Context, managed bool, log *zap.Logger) error {
-	// dbPath := filepath.Join(config.GetConfig().MetaDataPath, "metadb")
-	dbPath := ""
+func initBadger(ctx context.Context, cfg *Config, log *zap.Logger) (Database, error) {
+	var db *badger.DB
 	var err error
-	dbonce.Do(func() {
-		log.Info("Initializing DB")
-
-		opts := badger.DefaultOptions(filepath.Join(dbPath, "application")).
-			// WithLogger(logger.NewSubModuleLogger("pichus3.db"))
-			WithLogger(nil)
-
-		var db *badger.DB
-		if managed {
-			db, err = badger.OpenManaged(opts)
-			if err != nil {
-				return
-			}
-		} else {
-			db, err = badger.Open(opts)
-			if err != nil {
-				return
-			}
+	if cfg.Managed {
+		db, err = badger.OpenManaged(cfg.BadgerOptions)
+		if err != nil {
+			return nil, err
 		}
-
-		instance = &BadgerDB{DB: db, managed: managed, Path: dbPath}
-		errCh := make(chan error, 1)
-		// go instance.SubscribeToDBPublisher(ctx, errCh)
-		select {
-		case err = <-errCh:
-			db.Close()
-			return
-		case <-time.After(1 * time.Second):
-			// Subscription successful
+	} else {
+		db, err = badger.Open(cfg.BadgerOptions)
+		if err != nil {
+			return nil, err
 		}
+	}
 
-		go instance.RunVlogGC(ctx)
-	})
+	instance := &BadgerDB{
+		DB:      db,
+		managed: cfg.Managed,
+		Path:    cfg.BadgerOptions.Dir,
+		log:     log,
+	}
 
-	return err
-}
-
-func GetDB(ctx context.Context) Database {
-	return instance
+	go instance.RunVlogGC(ctx)
+	return instance, nil
 }
 
 func (bdb *BadgerDB) GetBadgerInstance() *badger.DB {
@@ -911,13 +880,12 @@ func (bdb *BadgerDB) runGC(ctx context.Context, lastSz *int64) {
 // 	log.Info("Stopped DB publisher subscription")
 // }
 
-func DbClose(ctx context.Context, log *zap.Logger) {
-	if instance != nil {
-		log.Info("Closing DB connection")
-		if err := instance.DB.Close(); err != nil {
-			log.Error("Error closing application DB", zap.Error(err))
-		}
+func (bdb *BadgerDB) Close(ctx context.Context) {
+	if err := bdb.DB.Close(); err != nil {
+		bdb.log.Error("Error closing Badger DB instance", zap.Error(err))
+		return
 	}
+	bdb.log.Info("Closed Badger DB instance")
 }
 
 var _ Database = (*BadgerDB)(nil)

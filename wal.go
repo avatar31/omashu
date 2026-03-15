@@ -29,18 +29,16 @@ type Wal struct {
 	mu  sync.RWMutex
 }
 
-func NewWal(logger *zap.Logger) (*Wal, error) {
-	// metadataPath := config.GetConfig().MetaDataPath
-	metadataPath := ""
-	waldir := filepath.Join(metadataPath, "wal")
+func newWal(baseDir string, log *zap.Logger) (*Wal, error) {
+	waldir := filepath.Join(baseDir, "wal")
 	if err := utils.CreateDirIfNotExists(waldir); err != nil {
-		logger.Error("Error creating wal directory", zap.Error(err))
+		log.Error("Error creating wal directory", zap.Error(err))
 		return nil, err
 	}
 
-	snapdir := filepath.Join(metadataPath, "snap")
+	snapdir := filepath.Join(baseDir, "snap")
 	if err := utils.CreateDirIfNotExists(snapdir); err != nil {
-		logger.Error("Error creating snap directory", zap.Error(err))
+		log.Error("Error creating snap directory", zap.Error(err))
 		return nil, err
 	}
 
@@ -48,14 +46,14 @@ func NewWal(logger *zap.Logger) (*Wal, error) {
 		return strings.HasPrefix(filename, "tmp")
 	})
 	if err != nil {
-		logger.Error("Error removing tmp files in snap directory", zap.Error(err))
+		log.Error("Error removing tmp files in snap directory", zap.Error(err))
 		return nil, err
 	}
 
 	return &Wal{
 		waldir:      waldir,
 		snapdir:     snapdir,
-		log:         logger,
+		log:         log,
 		existingWAL: wal.Exist(waldir),
 	}, nil
 }
@@ -101,7 +99,7 @@ func (w *Wal) loadLatestSnapshot() (*raftpb.Snapshot, error) {
 		return nil, err
 	}
 
-	// snapshot files can be orphaned if app crashes after writing them 
+	// snapshot files can be orphaned if app crashes after writing them
 	// but before writing the corresponding bwal log entries
 	snapshot, err := w.snapshotter.LoadNewestAvailable(walSnaps)
 	if err != nil && !errors.Is(err, snap.ErrNoSnapshot) {

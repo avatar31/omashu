@@ -21,7 +21,7 @@ type FSM struct {
 	log *zap.Logger
 }
 
-func NewFSM(database Database, logger *zap.Logger) *FSM {
+func newFSM(database Database, logger *zap.Logger) *FSM {
 	return &FSM{
 		db:  database,
 		log: logger,

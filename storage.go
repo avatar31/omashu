@@ -18,9 +18,9 @@ type Storage struct {
 	log *zap.Logger
 }
 
-func NewStorage(logger *zap.Logger) (*Storage, error) {
-	s := &Storage{log: logger}
-	wal, err := NewWal(s.log)
+func newStorage(baseDir string, log *zap.Logger) (*Storage, error) {
+	s := &Storage{log: log}
+	wal, err := newWal(baseDir, s.log)
 	if err != nil {
 		return nil, err
 	}
