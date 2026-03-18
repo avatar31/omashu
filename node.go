@@ -39,7 +39,7 @@ type Node struct {
 	storage   *Storage
 	transport *Transport
 	fsm       *FSM
-	cluster Cluster
+	cluster   Cluster
 
 	confState   raftpb.ConfState
 	confStateMu sync.RWMutex
@@ -57,7 +57,7 @@ type Node struct {
 	respNotifier       chan ProposeResp
 
 	// callbacks
-	onLeaderChange func(newLeader uint64)
+	onLeaderChange func(ctx context.Context, prevLeader, newLeader uint64)
 	onRemovedSelf  func()
 
 	mu  sync.RWMutex
@@ -99,7 +99,7 @@ func (node *Node) Start(ctx context.Context, cfg *Config) error {
 		peers = append(peers, raft.Peer{ID: id})
 	}
 
-	raft.SetLogger(newLogger("omashu.raft", cfg.Logger))
+	raft.SetLogger(newLogger(fmt.Sprintf("%s.raft", cfg.Name), cfg.Logger))
 	raftConf := &raft.Config{
 		ID:                          cfg.RaftConfig.ID,
 		ElectionTick:                cfg.RaftConfig.ElectionTick,
@@ -218,15 +218,15 @@ func (node *Node) run(ctx context.Context) {
 // Steps:
 // 1. Save snapshot (if any)
 // 2. Save state and entries to storage
-// 3. Apply snapshot to FSM (if any)
-// 4. Send messages to other nodes
+// 3. Send messages to other nodes
+// 4. Apply snapshot to FSM (if any)
 // 5. Apply committed entries to FSM
 func (node *Node) processReady(ctx context.Context, rd *raft.Ready) error {
 	// node.updateCommittedIndex(rd)
 	// node.setTerm(rd.Term)
 	if rd.SoftState != nil {
 		node.log.Info("Soft state changed", zap.String("softState", raft.DescribeSoftState(*rd.SoftState)))
-		node.handleLeaderChange(rd.SoftState.Lead)
+		node.handleLeaderChange(ctx, rd.SoftState.Lead)
 	}
 
 	pendingReadStates := make([]raft.ReadState, 0)
@@ -240,14 +240,20 @@ func (node *Node) processReady(ctx context.Context, rd *raft.Ready) error {
 		return err
 	}
 
+	// Per etcd raft protocol, messages MUST be sent before the snapshot is applied to the
+	// state machine. Specifically, any outbound MsgSnap (leader → lagging follower) must
+	// be dispatched first so the follower can start receiving the snapshot data while we
+	// proceed with local state updates. Applying the snapshot before sending would delay
+	// the transfer and, in edge cases where applySnapshotToFSM is slow or fails, could
+	// leave peers waiting indefinitely for a message that was never dispatched.
+	node.transport.Send(ctx, node.getMessagesToPublish(rd))
+
 	if !raft.IsEmptySnap(rd.Snapshot) {
 		if err := node.applySnapshotToFSM(ctx, rd.Snapshot); err != nil {
 			node.log.Error("Failed to apply snapshot to FSM", zap.Error(err))
 			return err
 		}
 	}
-
-	node.transport.Send(ctx, node.getMessagesToPublish(rd))
 
 	if entries := node.getEntriesToApply(rd.CommittedEntries); len(entries) > 0 {
 		selfRemove, err := node.applyEntries(ctx, entries)
@@ -292,15 +298,16 @@ func (node *Node) scheduleSelfRemoval() {
 	node.stopNotifier <- struct{}{}
 }
 
-func (node *Node) handleLeaderChange(newLeader uint64) {
+func (node *Node) handleLeaderChange(ctx context.Context, newLeader uint64) {
 	// Update local state and invoke hook. Avoid repeating if unchanged.
 	if newLeader == node.getLead() {
 		return
 	}
 
+	prevLeader := node.getLead()
 	node.setLead(newLeader)
 	if node.onLeaderChange != nil {
-		node.onLeaderChange(newLeader)
+		node.onLeaderChange(ctx, prevLeader, newLeader)
 	}
 }
 
@@ -482,6 +489,18 @@ func (node *Node) applyConfChange(ctx context.Context, entry raftpb.Entry) (bool
 	return false, nil
 }
 
+
+// Leader                                    Follower
+// ──────                                    ────────
+// takeSnapshotIfNeeded()                    receives MsgSnap
+//   FSM.CreateSnapshot()          ──────>   processReady()
+//   storage.CreateSnapshot()                  storage.SaveState()  (saves incoming snap)
+//     wal.SaveSnap()                           transport.Send()
+//     memStorage.Compact()                     FSM.RestoreSnapshot()
+//                                              n.Advance()
+// processReady()
+//   getMessagesToPublish()        ──────>   injects current confState into MsgSnap
+//   transport.Send(MsgSnap)
 func (node *Node) takeSnapshotIfNeeded(ctx context.Context, force bool) {
 	confState := node.getConfState()
 	snapshotIndex := node.storage.LastSnapshotIndex()
@@ -612,6 +631,14 @@ func (node *Node) getConfState() raftpb.ConfState {
 	node.confStateMu.RLock()
 	defer node.confStateMu.RUnlock()
 	return node.confState
+}
+
+func (node *Node) WithLeaderChangeHook(hook func(ctx context.Context, prevLeader, newLeader uint64)) {
+	node.onLeaderChange = hook
+}
+
+func (node *Node) WithRemovedSelfHook(hook func()) {
+	node.onRemovedSelf = hook
 }
 
 func (node *Node) Stop(ctx context.Context) {

@@ -2,7 +2,6 @@ package omashu
 
 import (
 	"context"
-	"sync"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -15,28 +14,15 @@ import (
 
 type FSM struct {
 	db  Database
-	tso *TSO
-
-	mu  sync.RWMutex
 	log *zap.Logger
 }
 
-func newFSM(database Database, logger *zap.Logger) *FSM {
-	return &FSM{
-		db:  database,
-		log: logger,
-	}
-}
-
-func (fsm *FSM) SetTSO(tso *TSO) {
-	fsm.tso = tso
+func newFSM(database Database, log *zap.Logger) *FSM {
+	return &FSM{db: database, log: log}
 }
 
 // Apply applies a committed log entry to the state machine
 func (fsm *FSM) Apply(ctx context.Context, data []byte) error {
-	fsm.mu.Lock()
-	defer fsm.mu.Unlock()
-
 	c, err := types.DecodeCommand(data)
 	if err != nil {
 		fsm.log.Error("Failed to entry data", zap.Error(err))
@@ -228,9 +214,6 @@ func (fsm *FSM) GetDB() Database {
 }
 
 func (fsm *FSM) RestoreSnapshot(ctx context.Context, snapshot raftpb.Snapshot) error {
-	fsm.mu.Lock()
-	defer fsm.mu.Unlock()
-
 	replicator, err := NewReplicator(fsm.db, fsm.log)
 	if err != nil {
 		fsm.log.Error("Failed to create DB replicator", zap.Error(err))
@@ -245,27 +228,12 @@ func (fsm *FSM) RestoreSnapshot(ctx context.Context, snapshot raftpb.Snapshot) e
 }
 
 func (fsm *FSM) CreateSnapshot(ctx context.Context) (uint64, []byte, error) {
-	fsm.mu.Lock()
-	defer fsm.mu.Unlock()
-
-	if fsm.tso == nil {
-		fsm.log.Panic("TSO is not set in FSM")
-	}
-
 	replicator, err := NewReplicator(fsm.db, fsm.log)
 	if err != nil {
 		return 0, nil, err
 	}
 
-	generation := fsm.tso.CurrentReadTs()
-	fsm.log.Info("Creating snapshot with generation", zap.Uint64("generation", generation))
-	upto, snapName, err := replicator.TakeSnapshot(ctx, generation)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer replicator.DeleteSnapshot(ctx, snapName)
-
-	content, err := replicator.ReadSnapshotContent(ctx, snapName)
+	upto, content, err := replicator.TakeSnapshot(ctx)
 	if err != nil {
 		return 0, nil, err
 	}

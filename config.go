@@ -20,6 +20,7 @@ type RaftConfig struct {
 }
 
 type Config struct {
+	Name    string
 	BaseDir string
 
 	BadgerOptions badger.Options
@@ -28,6 +29,10 @@ type Config struct {
 
 	Managed bool
 	Logger  *zap.Logger
+
+	// Hooks
+	OnLeaderChange func(prevLeader, newLeader uint64)
+	OnRemovedSelf  func()
 }
 
 func (cfg *Config) validate() error {
@@ -43,6 +48,10 @@ func (cfg *Config) validate() error {
 		return ErrMissingRaftConf
 	}
 
+	if cfg.Name == "" {
+		cfg.Name = "omashu"
+	}
+
 	cfg.BadgerOptions = cfg.BadgerOptions.WithDir(fmt.Sprintf("%s/%s", cfg.BaseDir, DBSubDir))
 	return nil
 }
@@ -54,11 +63,11 @@ func (cfg *Config) initializeLog() {
 		return
 	}
 
-	cfg.BadgerOptions = cfg.BadgerOptions.WithLogger(newLogger("omashu.badger", cfg.Logger))
+	cfg.BadgerOptions = cfg.BadgerOptions.WithLogger(newLogger(fmt.Sprintf("%s.badger", cfg.Name), cfg.Logger))
 }
 
 func newLogger(module string, log *zap.Logger) raft.Logger {
-	return &zapBadgerLogger{log: log.With(zap.String("module", module))}
+	return &zapBadgerLogger{log: log.With(zap.String("sub_module", module))}
 }
 
 type zapBadgerLogger struct {
