@@ -13,12 +13,12 @@ import (
 )
 
 type FSM struct {
-	db  Database
+	db  *Badger
 	log *zap.Logger
 }
 
-func newFSM(database Database, log *zap.Logger) *FSM {
-	return &FSM{db: database, log: log}
+func newFSM(db *Badger, log *zap.Logger) (*FSM, error) {
+	return &FSM{db: db, log: log}, nil
 }
 
 // Apply applies a committed log entry to the state machine
@@ -42,9 +42,9 @@ func (fsm *FSM) Apply(ctx context.Context, data []byte) error {
 	case types.CommandType_BATCH_WRITE:
 		applyErr = fsm.applyBatchWrite(ctx, c)
 	case types.CommandType_INCR_BY:
-		_, applyErr = fsm.applyIncrBy(ctx, c)
+		applyErr = fsm.applyIncrBy(ctx, c)
 	case types.CommandType_DECR_BY:
-		_, applyErr = fsm.applyDecrBy(ctx, c)
+		applyErr = fsm.applyDecrBy(ctx, c)
 	case types.CommandType_TRANSACTION:
 		applyErr = fsm.applyTransaction(ctx, c)
 	default:
@@ -64,13 +64,13 @@ func (fsm *FSM) getTtl(cmd *types.Command) []time.Duration {
 }
 
 func (fsm *FSM) applySet(ctx context.Context, cmd *types.Command) error {
-	return fsm.db.NewTransactionAt(ctx, cmd.ReadTs, cmd.CommitTs, func(ctx context.Context, txn *badger.Txn) error {
+	return fsm.db.newTransactionAt(ctx, cmd.ReadTs, cmd.CommitTs, func(ctx context.Context, txn *badger.Txn) error {
 		return fsm.db.SetWithTxn(ctx, txn, cmd.Key, cmd.Value, fsm.getTtl(cmd)...)
 	})
 }
 
 func (fsm *FSM) applyUpdate(ctx context.Context, cmd *types.Command) error {
-	return fsm.db.NewTransactionAt(ctx, cmd.ReadTs, cmd.CommitTs, func(ctx context.Context, txn *badger.Txn) error {
+	return fsm.db.newTransactionAt(ctx, cmd.ReadTs, cmd.CommitTs, func(ctx context.Context, txn *badger.Txn) error {
 		switch cmd.UpdateMeta.UpdateDeltaType {
 		case types.UpdateDeltaType_PROTOBUF:
 			v, err := cmd.UnmarshalUpdateDelta()
@@ -107,46 +107,38 @@ func (fsm *FSM) applyUpdate(ctx context.Context, cmd *types.Command) error {
 }
 
 func (fsm *FSM) applyDelete(ctx context.Context, cmd *types.Command) error {
-	return fsm.db.NewTransactionAt(ctx, cmd.ReadTs, cmd.CommitTs, func(ctx context.Context, txn *badger.Txn) error {
+	return fsm.db.newTransactionAt(ctx, cmd.ReadTs, cmd.CommitTs, func(ctx context.Context, txn *badger.Txn) error {
 		return fsm.db.DeleteWithTxn(ctx, txn, cmd.Key)
 	})
 }
 
 func (fsm *FSM) applyDeleteByPrefix(ctx context.Context, cmd *types.Command) error {
-	return fsm.db.NewTransactionAt(ctx, cmd.ReadTs, cmd.CommitTs, func(ctx context.Context, txn *badger.Txn) error {
+	return fsm.db.newTransactionAt(ctx, cmd.ReadTs, cmd.CommitTs, func(ctx context.Context, txn *badger.Txn) error {
 		fsm.db.DeleteByPrefixWithTxn(ctx, txn, cmd.Prefix)
 		return nil
 	})
 }
 
 func (fsm *FSM) applyBatchWrite(ctx context.Context, cmd *types.Command) error {
-	return fsm.db.NewTransactionAt(ctx, cmd.ReadTs, cmd.CommitTs, func(ctx context.Context, txn *badger.Txn) error {
-		return fsm.db.BatchWriteWithTxn(ctx, txn, cmd.SubCommands)
+	return fsm.db.newTransactionAt(ctx, cmd.ReadTs, cmd.CommitTs, func(ctx context.Context, txn *badger.Txn) error {
+		return fsm.db.batchWriteWithTxn(ctx, txn, cmd.SubCommands)
 	})
 }
 
-func (fsm *FSM) applyIncrBy(ctx context.Context, cmd *types.Command) (uint64, error) {
-	newVal := uint64(0)
-	err := fsm.db.NewTransactionAt(ctx, cmd.ReadTs, cmd.CommitTs, func(ctx context.Context, txn *badger.Txn) error {
-		var opErr error
-		newVal, opErr = fsm.db.IncrByWithTxn(ctx, txn, cmd.Key, cmd.IncrOrDecrDelta)
-		return opErr
+func (fsm *FSM) applyIncrBy(ctx context.Context, cmd *types.Command) error {
+	return fsm.db.newTransactionAt(ctx, cmd.ReadTs, cmd.CommitTs, func(ctx context.Context, txn *badger.Txn) error {
+		return fsm.db.IncrByWithTxn(ctx, txn, cmd.Key, cmd.IncrOrDecrDelta)
 	})
-	return newVal, err
 }
 
-func (fsm *FSM) applyDecrBy(ctx context.Context, cmd *types.Command) (uint64, error) {
-	newVal := uint64(0)
-	err := fsm.db.NewTransactionAt(ctx, cmd.ReadTs, cmd.CommitTs, func(ctx context.Context, txn *badger.Txn) error {
-		var opErr error
-		newVal, opErr = fsm.db.DecrByWithTxn(ctx, txn, cmd.Key, cmd.IncrOrDecrDelta)
-		return opErr
+func (fsm *FSM) applyDecrBy(ctx context.Context, cmd *types.Command) error {
+	return fsm.db.newTransactionAt(ctx, cmd.ReadTs, cmd.CommitTs, func(ctx context.Context, txn *badger.Txn) error {
+		return fsm.db.DecrByWithTxn(ctx, txn, cmd.Key, cmd.IncrOrDecrDelta)
 	})
-	return newVal, err
 }
 
 func (fsm *FSM) applyTransaction(ctx context.Context, cmd *types.Command) error {
-	return fsm.db.NewTransactionAt(ctx, cmd.ReadTs, cmd.CommitTs, func(ctx context.Context, txn *badger.Txn) error {
+	return fsm.db.newTransactionAt(ctx, cmd.ReadTs, cmd.CommitTs, func(ctx context.Context, txn *badger.Txn) error {
 		for _, subCmd := range cmd.SubCommands {
 			switch subCmd.Type {
 			case types.CommandType_SET:
@@ -192,12 +184,12 @@ func (fsm *FSM) applyTransaction(ctx context.Context, cmd *types.Command) error 
 					return err
 				}
 			case types.CommandType_INCR_BY:
-				_, err := fsm.db.IncrByWithTxn(ctx, txn, subCmd.Key, subCmd.IncrOrDecrDelta)
+				err := fsm.db.IncrByWithTxn(ctx, txn, subCmd.Key, subCmd.IncrOrDecrDelta)
 				if err != nil {
 					return err
 				}
 			case types.CommandType_DECR_BY:
-				_, err := fsm.db.DecrByWithTxn(ctx, txn, subCmd.Key, subCmd.IncrOrDecrDelta)
+				err := fsm.db.DecrByWithTxn(ctx, txn, subCmd.Key, subCmd.IncrOrDecrDelta)
 				if err != nil {
 					return err
 				}
@@ -207,10 +199,6 @@ func (fsm *FSM) applyTransaction(ctx context.Context, cmd *types.Command) error 
 		}
 		return nil
 	})
-}
-
-func (fsm *FSM) GetDB() Database {
-	return fsm.db
 }
 
 func (fsm *FSM) RestoreSnapshot(ctx context.Context, snapshot raftpb.Snapshot) error {
@@ -239,4 +227,10 @@ func (fsm *FSM) CreateSnapshot(ctx context.Context) (uint64, []byte, error) {
 	}
 
 	return upto, content, nil
+}
+
+func (fsm *FSM) Close(ctx context.Context) {
+	if fsm.db != nil {
+		fsm.db.Close(ctx)
+	}
 }

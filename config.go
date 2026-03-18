@@ -22,20 +22,19 @@ type RaftConfig struct {
 type Config struct {
 	Name    string
 	BaseDir string
+	Logger  *zap.Logger
 
 	BadgerOptions badger.Options
-	RaftConfig    *RaftConfig
-	Cluster       Cluster
 
-	Managed bool
-	Logger  *zap.Logger
+	RaftConfig  *RaftConfig
+	Cluster     Cluster
 
 	// Hooks
 	OnLeaderChange func(prevLeader, newLeader uint64)
 	OnRemovedSelf  func()
 }
 
-func (cfg *Config) validate() error {
+func (cfg *Config) validate(distributed bool) error {
 	if cfg.Cluster == nil {
 		return ErrMissingCluster
 	}
@@ -44,7 +43,7 @@ func (cfg *Config) validate() error {
 		return ErrMissingBaseDir
 	}
 
-	if cfg.Managed && cfg.RaftConfig == nil {
+	if distributed && cfg.RaftConfig == nil {
 		return ErrMissingRaftConf
 	}
 

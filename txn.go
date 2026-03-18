@@ -14,11 +14,11 @@ import (
 )
 
 type TxnManager struct {
-	db  *DBStore
+	db  *DistributedBadger
 	tso *TSO
 }
 
-func newTxnManager(db *DBStore, tso *TSO) *TxnManager {
+func newTxnManager(db *DistributedBadger, tso *TSO) *TxnManager {
 	return &TxnManager{db: db, tso: tso}
 }
 
@@ -43,7 +43,7 @@ func (tm *TxnManager) BeginTxn(ctx context.Context, update bool) *Txn {
 type Txn struct {
 	id  string
 	cmd *types.Command
-	db  *DBStore
+	db  *DistributedBadger
 	tso *TSO
 
 	readTs   uint64
