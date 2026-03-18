@@ -17,74 +17,29 @@ import (
 	"github.com/avatar31/omashu/utils"
 )
 
-type Database interface {
-	BulkGet(ctx context.Context, keys []string) (map[string][]byte, error)
-	BatchWrite(ctx context.Context, ops []*types.Command) error
-	BatchWriteWithTxn(ctx context.Context, txn *badger.Txn, ops []*types.Command) error
-	Count(ctx context.Context, prefix string) int
-	DecrBy(ctx context.Context, key string, delta uint64) (uint64, error)
-	DecrByWithTxn(ctx context.Context, txn *badger.Txn, key string, delta uint64) (uint64, error)
-	Delete(ctx context.Context, key string) error
-	DeleteWithTxn(ctx context.Context, txn *badger.Txn, key string) error
-	DeleteByPrefix(ctx context.Context, prefix string) error
-	DeleteByPrefixWithTxn(ctx context.Context, txn *badger.Txn, prefix string)
-	Exists(ctx context.Context, key string) bool
-	GetBadgerInstance() *badger.DB
-	Get(ctx context.Context, key string) ([]byte, bool, error)
-	GetAt(ctx context.Context, key string, readTs uint64) ([]byte, bool, error)
-	GetWithTxn(ctx context.Context, txn *badger.Txn, key string) ([]byte, bool, error)
-	GetByPrefix(ctx context.Context, prefix string) (map[string][]byte, error)
-	GetByPrefixWithTxn(ctx context.Context, txn *badger.Txn, prefix string) (map[string][]byte, error)
-	GetByPrefixAt(ctx context.Context, prefix string, readTs uint64) (map[string][]byte, error)
-	GetKeysByPrefix(ctx context.Context, prefix string) ([]string, error)
-	GetKeysByPrefixAt(ctx context.Context, prefix string, readTs uint64) ([]string, error)
-	GetKeysByPrefixWithTxn(ctx context.Context, txn *badger.Txn, prefix string) ([]string, error)
-	HasChild(ctx context.Context, prefix string) bool
-	IncrBy(ctx context.Context, key string, delta uint64) (uint64, error)
-	IncrByWithTxn(ctx context.Context, txn *badger.Txn, key string, delta uint64) (uint64, error)
-	IterateByPrefix(ctx context.Context, prefix, startCursor string, limit *int, process func(k, v []byte) bool) (string, error)
-	NewTransaction(ctx context.Context, readOnly bool, performOps func(context.Context, *badger.Txn) error) error
-	NewTransactionAt(ctx context.Context, readTs, commitTs uint64,
-		performOps func(context.Context, *badger.Txn) error) error
-	Set(ctx context.Context, key string, value []byte, ttl ...time.Duration) error
-	SetWithTxn(ctx context.Context, txn *badger.Txn, key string, value []byte, ttl ...time.Duration) error
-	UpdateJson(ctx context.Context, key string, delta map[string]any, ttl ...time.Duration) error
-	UpdateJsonWithTxn(ctx context.Context, txn *badger.Txn, key string, delta map[string]any, ttl ...time.Duration) error
-	UpdateProtobuf(ctx context.Context, key string, delta proto.Message, ttl ...time.Duration) error
-	UpdateProtobufWithTxn(ctx context.Context, txn *badger.Txn, key string, delta proto.Message, ttl ...time.Duration) error
-	Close(ctx context.Context)
-}
-
-type BadgerDB struct {
-	managed bool
-	Path    string
-	DB      *badger.DB
-	log     *zap.Logger
-}
-
 const (
 	MaxBatchSize = 1000
 )
 
-func initBadger(ctx context.Context, cfg *Config, log *zap.Logger) (Database, error) {
+func initBadger(ctx context.Context, managed bool, opts badger.Options, log *zap.Logger) (*Badger, error) {
 	var db *badger.DB
 	var err error
-	if cfg.Managed {
-		db, err = badger.OpenManaged(cfg.BadgerOptions)
+	if managed {
+		db, err = badger.OpenManaged(opts)
 		if err != nil {
 			return nil, err
 		}
 	} else {
-		db, err = badger.Open(cfg.BadgerOptions)
+		db, err = badger.Open(opts)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	instance := &BadgerDB{
-		DB:      db,
-		managed: cfg.Managed,
-		Path:    cfg.BadgerOptions.Dir,
+	instance := &Badger{
+		db:      db,
+		managed: managed,
+		path:    opts.Dir,
 		log:     log,
 	}
 
@@ -92,27 +47,9 @@ func initBadger(ctx context.Context, cfg *Config, log *zap.Logger) (Database, er
 	return instance, nil
 }
 
-func (bdb *BadgerDB) GetBadgerInstance() *badger.DB {
-	return bdb.DB
-}
+// DBReadOps Interface
 
-func (bdb *BadgerDB) Exists(ctx context.Context, key string) bool {
-	err := bdb.DB.View(func(txn *badger.Txn) error {
-		_, err := txn.Get([]byte(key))
-		return err
-	})
-	if err != nil {
-		if errors.Is(err, badger.ErrKeyNotFound) {
-			return false
-		}
-		bdb.log.Error("Error while checking key exist or not", zap.String("key", key), zap.Error(err))
-		return false
-	}
-
-	return true
-}
-
-func (bdb *BadgerDB) Count(ctx context.Context, prefix string) int {
+func (bdb *Badger) Count(ctx context.Context, prefix string) int {
 	count := 0
 	prefixBytes := []byte(prefix)
 
@@ -134,62 +71,33 @@ func (bdb *BadgerDB) Count(ctx context.Context, prefix string) int {
 		return nil
 	}
 
-	bdb.DB.View(func(txn *badger.Txn) error {
+	bdb.db.View(func(txn *badger.Txn) error {
 		return iterate(txn)
 	})
 
 	return count
 }
 
-func (bdb *BadgerDB) GetKeysByPrefixAt(ctx context.Context, prefix string, readTs uint64) ([]string, error) {
-	keys := []string{}
-	var err error
-
-	bdb.NewReadOnlyTransactionAt(ctx, readTs, func(ctx context.Context, txn *badger.Txn) error {
-		keys, err = bdb.GetKeysByPrefixWithTxn(ctx, txn, prefix)
+func (bdb *Badger) Exists(ctx context.Context, key string) bool {
+	err := bdb.db.View(func(txn *badger.Txn) error {
+		_, err := txn.Get([]byte(key))
 		return err
 	})
-
-	return keys, err
-}
-
-func (bdb *BadgerDB) GetKeysByPrefixWithTxn(ctx context.Context, txn *badger.Txn,
-	prefix string) ([]string, error) {
-	keys := []string{}
-	prefixBytes := []byte(prefix)
-
-	opts := badger.DefaultIteratorOptions
-	opts.PrefetchValues = false // We're only interested in keys
-	it := txn.NewIterator(opts)
-	defer it.Close()
-
-	for it.Seek(prefixBytes); it.ValidForPrefix(prefixBytes); it.Next() {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
+	if err != nil {
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return false
 		}
-		keys = append(keys, string(it.Item().KeyCopy(nil)))
+		bdb.log.Error("Error while checking key exist or not", zap.String("key", key), zap.Error(err))
+		return false
 	}
 
-	return keys, nil
+	return true
 }
 
-func (bdb *BadgerDB) GetKeysByPrefix(ctx context.Context, prefix string) ([]string, error) {
-	keys := []string{}
-	var err error
-	bdb.DB.View(func(txn *badger.Txn) error {
-		keys, err = bdb.GetKeysByPrefixWithTxn(ctx, txn, prefix)
-		return err
-	})
-
-	return keys, err
-}
-
-func (bdb *BadgerDB) HasChild(ctx context.Context, prefix string) bool {
+func (bdb *Badger) HasChild(ctx context.Context, prefix string) bool {
 	prefixBytes := []byte(prefix)
 	has := false
-	bdb.DB.View(func(txn *badger.Txn) error {
+	bdb.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false // We're only interested in keys
 		it := txn.NewIterator(opts)
@@ -203,82 +111,10 @@ func (bdb *BadgerDB) HasChild(ctx context.Context, prefix string) bool {
 	return has
 }
 
-func (bdb *BadgerDB) IncrBy(ctx context.Context, key string, delta uint64) (uint64, error) {
-	var newVal uint64
-	err := bdb.NewTransaction(ctx, false, func(ctx context.Context, txn *badger.Txn) error {
-		var err error
-		newVal, err = bdb.IncrByWithTxn(ctx, txn, key, delta)
-		return err
-	})
-	if err != nil {
-		return 0, err
-	}
-
-	return newVal, nil
-}
-
-func (bdb *BadgerDB) IncrByWithTxn(ctx context.Context, txn *badger.Txn, key string, delta uint64) (uint64, error) {
-	b, ok, err := bdb.GetWithTxn(ctx, txn, key)
-	if err != nil {
-		return 0, err
-	}
-
-	if ok {
-		currentVal := utils.BytesToUint64(b)
-		delta = currentVal + delta
-	}
-
-	err = bdb.SetWithTxn(ctx, txn, key, utils.Uint64ToBytes(delta))
-	if err != nil {
-		return 0, err
-	}
-
-	return delta, nil
-}
-
-func (bdb *BadgerDB) DecrBy(ctx context.Context, key string, delta uint64) (uint64, error) {
-	var newVal uint64
-	err := bdb.NewTransaction(ctx, false, func(ctx context.Context, txn *badger.Txn) error {
-		var err error
-		newVal, err = bdb.DecrByWithTxn(ctx, txn, key, delta)
-		return err
-	})
-	if err != nil {
-		return 0, err
-	}
-
-	return newVal, nil
-}
-
-func (bdb *BadgerDB) DecrByWithTxn(ctx context.Context, txn *badger.Txn, key string, delta uint64) (uint64, error) {
-	b, ok, err := bdb.GetWithTxn(ctx, txn, key)
-	if err != nil {
-		return 0, err
-	}
-
-	if ok {
-		currentVal := utils.BytesToUint64(b)
-		if currentVal < delta {
-			delta = 0
-		} else {
-			delta = currentVal - delta
-		}
-	} else {
-		delta = 0
-	}
-
-	err = bdb.SetWithTxn(ctx, txn, key, utils.Uint64ToBytes(delta))
-	if err != nil {
-		return 0, err
-	}
-
-	return delta, nil
-}
-
-func (bdb *BadgerDB) Get(ctx context.Context, key string) ([]byte, bool, error) {
+func (bdb *Badger) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	var value []byte
 	var exist bool
-	err := bdb.DB.View(func(txn *badger.Txn) error {
+	err := bdb.db.View(func(txn *badger.Txn) error {
 		var err error
 		value, exist, err = bdb.GetWithTxn(ctx, txn, key)
 		return err
@@ -287,49 +123,7 @@ func (bdb *BadgerDB) Get(ctx context.Context, key string) ([]byte, bool, error) 
 	return value, exist, err
 }
 
-func (bdb *BadgerDB) GetAt(ctx context.Context, key string, readTs uint64) ([]byte, bool, error) {
-	var val []byte
-	var exist bool
-	err := bdb.NewReadOnlyTransactionAt(ctx, readTs, func(ctx context.Context, txn *badger.Txn) error {
-		var txErr error
-		val, exist, txErr = bdb.GetWithTxn(ctx, txn, key)
-		if txErr != nil {
-			return txErr
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, false, err
-	}
-
-	return val, exist, nil
-}
-
-func (bdb *BadgerDB) BulkGet(ctx context.Context, keys []string) (map[string][]byte, error) {
-	result := make(map[string][]byte)
-	err := bdb.DB.View(func(txn *badger.Txn) error {
-		for _, k := range keys {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-			}
-
-			value, exist, err := bdb.GetWithTxn(ctx, txn, k)
-			if err != nil {
-				return err
-			}
-			if exist {
-				result[k] = value
-			}
-		}
-		return nil
-	})
-
-	return result, err
-}
-
-func (bdb *BadgerDB) GetWithTxn(ctx context.Context, txn *badger.Txn, key string) ([]byte, bool, error) {
+func (bdb *Badger) GetWithTxn(ctx context.Context, txn *badger.Txn, key string) ([]byte, bool, error) {
 	item, err := txn.Get([]byte(key))
 	if err != nil {
 		if errors.Is(err, badger.ErrKeyNotFound) {
@@ -349,10 +143,10 @@ func (bdb *BadgerDB) GetWithTxn(ctx context.Context, txn *badger.Txn, key string
 	return value, true, nil
 }
 
-func (bdb *BadgerDB) GetByPrefix(ctx context.Context, prefix string) (map[string][]byte, error) {
+func (bdb *Badger) GetByPrefix(ctx context.Context, prefix string) (map[string][]byte, error) {
 	result := map[string][]byte{}
 
-	err := bdb.DB.View(func(txn *badger.Txn) error {
+	err := bdb.db.View(func(txn *badger.Txn) error {
 		var err error
 		result, err = bdb.GetByPrefixWithTxn(ctx, txn, prefix)
 		return err
@@ -365,24 +159,7 @@ func (bdb *BadgerDB) GetByPrefix(ctx context.Context, prefix string) (map[string
 	return result, nil
 }
 
-func (bdb *BadgerDB) GetByPrefixAt(ctx context.Context, prefix string, readTs uint64) (map[string][]byte, error) {
-	result := map[string][]byte{}
-
-	err := bdb.NewReadOnlyTransactionAt(ctx, readTs, func(ctx context.Context, txn *badger.Txn) error {
-		var err error
-		result, err = bdb.GetByPrefixWithTxn(ctx, txn, prefix)
-		return err
-	})
-	if err != nil {
-		bdb.log.Error("Error while reading data from database", zap.String("prefix", prefix),
-			zap.Uint64("readTs", readTs), zap.Error(err))
-		return nil, err
-	}
-
-	return result, nil
-}
-
-func (bdb *BadgerDB) GetByPrefixWithTxn(ctx context.Context, txn *badger.Txn,
+func (bdb *Badger) GetByPrefixWithTxn(ctx context.Context, txn *badger.Txn,
 	prefix string) (map[string][]byte, error) {
 	result := map[string][]byte{}
 	prefixBytes := []byte(prefix)
@@ -412,11 +189,68 @@ func (bdb *BadgerDB) GetByPrefixWithTxn(ctx context.Context, txn *badger.Txn,
 	return result, nil
 }
 
+func (bdb *Badger) GetKeysByPrefix(ctx context.Context, prefix string) ([]string, error) {
+	keys := []string{}
+	var err error
+	bdb.db.View(func(txn *badger.Txn) error {
+		keys, err = bdb.GetKeysByPrefixWithTxn(ctx, txn, prefix)
+		return err
+	})
+
+	return keys, err
+}
+
+func (bdb *Badger) GetKeysByPrefixWithTxn(ctx context.Context, txn *badger.Txn,
+	prefix string) ([]string, error) {
+	keys := []string{}
+	prefixBytes := []byte(prefix)
+
+	opts := badger.DefaultIteratorOptions
+	opts.PrefetchValues = false // We're only interested in keys
+	it := txn.NewIterator(opts)
+	defer it.Close()
+
+	for it.Seek(prefixBytes); it.ValidForPrefix(prefixBytes); it.Next() {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		keys = append(keys, string(it.Item().KeyCopy(nil)))
+	}
+
+	return keys, nil
+}
+
+func (bdb *Badger) BulkGet(ctx context.Context, keys []string) (map[string][]byte, error) {
+	result := make(map[string][]byte)
+	err := bdb.db.View(func(txn *badger.Txn) error {
+		for _, k := range keys {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+
+			value, exist, err := bdb.GetWithTxn(ctx, txn, k)
+			if err != nil {
+				return err
+			}
+			if exist {
+				result[k] = value
+			}
+		}
+		return nil
+	})
+
+	return result, err
+}
+
 // https://docs.hypermode.com/badger/quickstart#possible-pagination-implementation-using-prefix-scans
-func (bdb *BadgerDB) IterateByPrefix(ctx context.Context, prefix, startCursor string, limit *int,
+func (bdb *Badger) IterateByPrefix(ctx context.Context, prefix, startCursor string, limit *int,
 	process func(k, v []byte) bool) (string, error) {
 	nextCursor := ""
-	err := bdb.DB.View(func(txn *badger.Txn) error {
+	err := bdb.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = true
 		it := txn.NewIterator(opts)
@@ -477,19 +311,67 @@ func (bdb *BadgerDB) IterateByPrefix(ctx context.Context, prefix, startCursor st
 	return nextCursor, nil
 }
 
-func (bdb *BadgerDB) Set(ctx context.Context, key string, value []byte, ttl ...time.Duration) error {
+// DBWriteOps Interface
+
+func (bdb *Badger) DecrBy(ctx context.Context, key string, delta uint64) error {
+	return bdb.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
+		return bdb.DecrByWithTxn(ctx, txn, key, delta)
+	})
+}
+
+func (bdb *Badger) DecrByWithTxn(ctx context.Context, txn *badger.Txn, key string, delta uint64) error {
+	b, ok, err := bdb.GetWithTxn(ctx, txn, key)
+	if err != nil {
+		return err
+	}
+
+	if ok {
+		currentVal := utils.BytesToUint64(b)
+		if currentVal < delta {
+			delta = 0
+		} else {
+			delta = currentVal - delta
+		}
+	} else {
+		delta = 0
+	}
+
+	return bdb.SetWithTxn(ctx, txn, key, utils.Uint64ToBytes(delta))
+}
+
+func (bdb *Badger) IncrBy(ctx context.Context, key string, delta uint64) error {
+	return bdb.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
+		return bdb.IncrByWithTxn(ctx, txn, key, delta)
+	})
+}
+
+func (bdb *Badger) IncrByWithTxn(ctx context.Context, txn *badger.Txn, key string, delta uint64) error {
+	b, ok, err := bdb.GetWithTxn(ctx, txn, key)
+	if err != nil {
+		return err
+	}
+
+	if ok {
+		currentVal := utils.BytesToUint64(b)
+		delta = currentVal + delta
+	}
+
+	return bdb.SetWithTxn(ctx, txn, key, utils.Uint64ToBytes(delta))
+}
+
+func (bdb *Badger) Set(ctx context.Context, key string, value []byte, ttl ...time.Duration) error {
 	if bdb.managed {
-		return bdb.NewTransaction(ctx, false, func(ctx context.Context, txn *badger.Txn) error {
+		return bdb.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
 			return bdb.SetWithTxn(ctx, txn, key, value, ttl...)
 		})
 	}
 
-	return bdb.DB.Update(func(txn *badger.Txn) error {
+	return bdb.db.Update(func(txn *badger.Txn) error {
 		return bdb.SetWithTxn(ctx, txn, key, value, ttl...)
 	})
 }
 
-func (bdb *BadgerDB) SetWithTxn(ctx context.Context, txn *badger.Txn, key string, value []byte,
+func (bdb *Badger) SetWithTxn(ctx context.Context, txn *badger.Txn, key string, value []byte,
 	ttl ...time.Duration) error {
 	entry := badger.NewEntry([]byte(key), value)
 	if len(ttl) > 0 {
@@ -499,14 +381,95 @@ func (bdb *BadgerDB) SetWithTxn(ctx context.Context, txn *badger.Txn, key string
 	return txn.SetEntry(entry)
 }
 
-func (bdb *BadgerDB) Delete(ctx context.Context, key string) error {
+func (bdb *Badger) UpdateJson(ctx context.Context, key string, delta map[string]any, ttl ...time.Duration) error {
+	return bdb.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
+		return bdb.UpdateJsonWithTxn(ctx, txn, key, delta, ttl...)
+	})
+}
+
+func (bdb *Badger) UpdateJsonWithTxn(ctx context.Context, txn *badger.Txn, key string,
+	delta map[string]any, ttl ...time.Duration) error {
+	fullMsgBytes, exist, err := bdb.GetWithTxn(ctx, txn, key)
+	if err != nil {
+		return err
+	}
+
+	var fullMsg map[string]any
+	if exist {
+		err = json.Unmarshal(fullMsgBytes, &fullMsg)
+		if err != nil {
+			bdb.log.Error("Failed to unmarshal existing JSON", zap.String("key", key), zap.Error(err))
+			return err
+		}
+	} else {
+		fullMsg = make(map[string]any)
+	}
+
+	maps.Copy(fullMsg, delta)
+
+	mergedBytes, err := json.Marshal(fullMsg)
+	if err != nil {
+		bdb.log.Error("Failed to marshal merged JSON", zap.String("key", key), zap.Error(err))
+		return err
+	}
+
+	return bdb.SetWithTxn(ctx, txn, key, mergedBytes, ttl...)
+}
+
+func (bdb *Badger) UpdateProtobuf(ctx context.Context, key string, delta proto.Message,
+	ttl ...time.Duration) error {
+	return bdb.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
+		return bdb.UpdateProtobufWithTxn(ctx, txn, key, delta, ttl...)
+	})
+}
+
+func (bdb *Badger) UpdateProtobufWithTxn(ctx context.Context, txn *badger.Txn, key string,
+	delta proto.Message, ttl ...time.Duration) error {
+	fullMsgBytes, exist, err := bdb.GetWithTxn(ctx, txn, key)
+	if err != nil {
+		return err
+	}
+
+	var mergedBytes []byte
+	if exist {
+		fullMsg := dynamicpb.NewMessage(delta.ProtoReflect().Descriptor())
+		err = proto.Unmarshal(fullMsgBytes, fullMsg)
+		if err != nil {
+			bdb.log.Error("Failed to unmarshal existing Protobuf", zap.String("key", key), zap.Error(err))
+			return err
+		}
+
+		err = types.MergeProtobufMessages(fullMsg, delta)
+		if err != nil {
+			bdb.log.Error("Failed to merge Protobuf messages", zap.String("key", key), zap.Error(err))
+			return err
+		}
+
+		mergedBytes, err = proto.Marshal(fullMsg)
+		if err != nil {
+			bdb.log.Error("Failed to marshal merged Protobuf", zap.String("key", key), zap.Error(err))
+			return err
+		}
+	} else {
+		mergedBytes, err = proto.Marshal(delta)
+		if err != nil {
+			bdb.log.Error("Failed to marshal delta Protobuf", zap.String("key", key), zap.Error(err))
+			return err
+		}
+	}
+	return bdb.SetWithTxn(ctx, txn, key, mergedBytes, ttl...)
+}
+
+// DBDeleteOps Interface
+
+func (bdb *Badger) Delete(ctx context.Context, key string) error {
 	var err error
 	if bdb.managed {
-		err = bdb.NewTransaction(ctx, false, func(ctx context.Context, txn *badger.Txn) error {
+		err = bdb.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
 			return bdb.DeleteWithTxn(ctx, txn, key)
 		})
 	} else {
-		err = bdb.DB.Update(func(txn *badger.Txn) error {
+		err = bdb.db.Update(func(txn *badger.Txn) error {
 			return bdb.DeleteWithTxn(ctx, txn, key)
 		})
 	}
@@ -520,15 +483,19 @@ func (bdb *BadgerDB) Delete(ctx context.Context, key string) error {
 	return err
 }
 
-func (bdb *BadgerDB) DeleteByPrefix(ctx context.Context, prefix string) error {
+func (bdb *Badger) DeleteWithTxn(ctx context.Context, txn *badger.Txn, key string) error {
+	return txn.Delete([]byte(key))
+}
+
+func (bdb *Badger) DeleteByPrefix(ctx context.Context, prefix string) error {
 	var err error
 	if bdb.managed {
-		err = bdb.NewTransaction(ctx, false, func(ctx context.Context, txn *badger.Txn) error {
+		err = bdb.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
 			bdb.DeleteByPrefixWithTxn(ctx, txn, prefix)
 			return nil
 		})
 	} else {
-		err = bdb.DB.Update(func(txn *badger.Txn) error {
+		err = bdb.db.Update(func(txn *badger.Txn) error {
 			bdb.DeleteByPrefixWithTxn(ctx, txn, prefix)
 			return nil
 		})
@@ -541,7 +508,7 @@ func (bdb *BadgerDB) DeleteByPrefix(ctx context.Context, prefix string) error {
 	return nil
 }
 
-func (bdb *BadgerDB) DeleteByPrefixWithTxn(ctx context.Context, txn *badger.Txn, prefix string) {
+func (bdb *Badger) DeleteByPrefixWithTxn(ctx context.Context, txn *badger.Txn, prefix string) error {
 	prefixBytes := []byte(prefix)
 	opts := badger.DefaultIteratorOptions
 	opts.PrefetchValues = false // We're only interested in keys
@@ -551,7 +518,7 @@ func (bdb *BadgerDB) DeleteByPrefixWithTxn(ctx context.Context, txn *badger.Txn,
 	for it.Seek(prefixBytes); it.ValidForPrefix(prefixBytes); it.Next() {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		default:
 		}
 
@@ -560,18 +527,22 @@ func (bdb *BadgerDB) DeleteByPrefixWithTxn(ctx context.Context, txn *badger.Txn,
 		err := bdb.DeleteWithTxn(ctx, txn, key)
 		if err != nil && err != badger.ErrKeyNotFound {
 			bdb.log.Warn("Error while deleting data in database", zap.String("key", key), zap.Error(err))
-			continue
+			return err
 		}
 	}
+
+	return nil
 }
 
-func (bdb *BadgerDB) DeleteWithTxn(ctx context.Context, txn *badger.Txn, key string) error {
-	return txn.Delete([]byte(key))
+// Database Interface
+
+func (bdb *Badger) GetBadger() *badger.DB {
+	return bdb.db
 }
 
-func (bdb *BadgerDB) NewTransaction(ctx context.Context, readOnly bool,
+func (bdb *Badger) NewTransaction(ctx context.Context,
 	performOps func(context.Context, *badger.Txn) error) error {
-	txn := bdb.DB.NewTransaction(!readOnly)
+	txn := bdb.db.NewTransaction(true)
 	defer txn.Discard()
 
 	err := performOps(ctx, txn)
@@ -582,9 +553,79 @@ func (bdb *BadgerDB) NewTransaction(ctx context.Context, readOnly bool,
 	return txn.Commit()
 }
 
-func (bdb *BadgerDB) NewTransactionAt(ctx context.Context, readTs, commitTs uint64,
+func (bdb *Badger) Close(ctx context.Context) {
+	if err := bdb.db.Close(); err != nil {
+		bdb.log.Error("Error closing Badger DB instance", zap.Error(err))
+		return
+	}
+	bdb.log.Info("Closed Badger DB instance")
+}
+
+// Helpers
+
+func (bdb *Badger) getKeysByPrefixAt(ctx context.Context, prefix string, readTs uint64) ([]string, error) {
+	keys := []string{}
+	var err error
+
+	bdb.newReadOnlyTransactionAt(ctx, readTs, func(ctx context.Context, txn *badger.Txn) error {
+		keys, err = bdb.GetKeysByPrefixWithTxn(ctx, txn, prefix)
+		return err
+	})
+
+	return keys, err
+}
+
+func (bdb *Badger) getAt(ctx context.Context, key string, readTs uint64) ([]byte, bool, error) {
+	var val []byte
+	var exist bool
+	err := bdb.newReadOnlyTransactionAt(ctx, readTs, func(ctx context.Context, txn *badger.Txn) error {
+		var txErr error
+		val, exist, txErr = bdb.GetWithTxn(ctx, txn, key)
+		if txErr != nil {
+			return txErr
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+
+	return val, exist, nil
+}
+
+func (bdb *Badger) getByPrefixAt(ctx context.Context, prefix string, readTs uint64) (map[string][]byte, error) {
+	result := map[string][]byte{}
+
+	err := bdb.newReadOnlyTransactionAt(ctx, readTs, func(ctx context.Context, txn *badger.Txn) error {
+		var err error
+		result, err = bdb.GetByPrefixWithTxn(ctx, txn, prefix)
+		return err
+	})
+	if err != nil {
+		bdb.log.Error("Error while reading data from database", zap.String("prefix", prefix),
+			zap.Uint64("readTs", readTs), zap.Error(err))
+		return nil, err
+	}
+
+	return result, nil
+}
+
+func (bdb *Badger) newReadonlyTransaction(ctx context.Context,
 	performOps func(context.Context, *badger.Txn) error) error {
-	txn := bdb.DB.NewTransactionAt(readTs, true)
+	txn := bdb.db.NewTransaction(false)
+	defer txn.Discard()
+
+	err := performOps(ctx, txn)
+	if err != nil {
+		return err
+	}
+
+	return txn.Commit()
+}
+
+func (bdb *Badger) newTransactionAt(ctx context.Context, readTs, commitTs uint64,
+	performOps func(context.Context, *badger.Txn) error) error {
+	txn := bdb.db.NewTransactionAt(readTs, true)
 	defer txn.Discard()
 
 	err := performOps(ctx, txn)
@@ -595,9 +636,9 @@ func (bdb *BadgerDB) NewTransactionAt(ctx context.Context, readTs, commitTs uint
 	return txn.CommitAt(commitTs, nil)
 }
 
-func (bdb *BadgerDB) NewReadOnlyTransactionAt(ctx context.Context, readTs uint64,
+func (bdb *Badger) newReadOnlyTransactionAt(ctx context.Context, readTs uint64,
 	performOps func(context.Context, *badger.Txn) error) error {
-	txn := bdb.DB.NewTransactionAt(readTs, false)
+	txn := bdb.db.NewTransactionAt(readTs, false)
 	defer txn.Discard()
 
 	err := performOps(ctx, txn)
@@ -608,7 +649,7 @@ func (bdb *BadgerDB) NewReadOnlyTransactionAt(ctx context.Context, readTs uint64
 	return nil
 }
 
-func (bdb *BadgerDB) BatchWrite(ctx context.Context, ops []*types.Command) error {
+func (bdb *Badger) batchWrite(ctx context.Context, ops []*types.Command) error {
 	count := len(ops)
 	if count == 0 {
 		return nil
@@ -619,8 +660,8 @@ func (bdb *BadgerDB) BatchWrite(ctx context.Context, ops []*types.Command) error
 	}
 
 	bdb.log.Info("Performing batch operations", zap.Int("count", count))
-	err := bdb.NewTransaction(ctx, false, func(ctx context.Context, txn *badger.Txn) error {
-		return bdb.BatchWriteWithTxn(ctx, txn, ops)
+	err := bdb.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
+		return bdb.batchWriteWithTxn(ctx, txn, ops)
 	})
 	if err != nil {
 		bdb.log.Error("Error while performing batch operations", zap.Error(err))
@@ -630,7 +671,7 @@ func (bdb *BadgerDB) BatchWrite(ctx context.Context, ops []*types.Command) error
 	return nil
 }
 
-func (bdb *BadgerDB) BatchWriteWithTxn(ctx context.Context, txn *badger.Txn, ops []*types.Command) error {
+func (bdb *Badger) batchWriteWithTxn(ctx context.Context, txn *badger.Txn, ops []*types.Command) error {
 	for i := range ops {
 		switch ops[i].Type {
 		case types.CommandType_SET:
@@ -696,7 +737,7 @@ func (bdb *BadgerDB) BatchWriteWithTxn(ctx context.Context, txn *badger.Txn, ops
 			}
 
 		case types.CommandType_INCR_BY:
-			_, err := bdb.IncrByWithTxn(ctx, txn, ops[i].Key, ops[i].IncrOrDecrDelta)
+			err := bdb.IncrByWithTxn(ctx, txn, ops[i].Key, ops[i].IncrOrDecrDelta)
 			if err != nil {
 				bdb.log.Error("Error while adding incrby operation to transaction", zap.String("key", ops[i].Key),
 					zap.Error(err))
@@ -704,7 +745,7 @@ func (bdb *BadgerDB) BatchWriteWithTxn(ctx context.Context, txn *badger.Txn, ops
 			}
 
 		case types.CommandType_DECR_BY:
-			_, err := bdb.DecrByWithTxn(ctx, txn, ops[i].Key, ops[i].IncrOrDecrDelta)
+			err := bdb.DecrByWithTxn(ctx, txn, ops[i].Key, ops[i].IncrOrDecrDelta)
 			if err != nil {
 				bdb.log.Error("Error while adding decrby operation to transaction", zap.String("key", ops[i].Key),
 					zap.Error(err))
@@ -723,90 +764,11 @@ func (bdb *BadgerDB) BatchWriteWithTxn(ctx context.Context, txn *badger.Txn, ops
 	return nil
 }
 
-func (bdb *BadgerDB) UpdateJson(ctx context.Context, key string, delta map[string]any, ttl ...time.Duration) error {
-	return bdb.NewTransaction(ctx, false, func(ctx context.Context, txn *badger.Txn) error {
-		return bdb.UpdateJsonWithTxn(ctx, txn, key, delta, ttl...)
-	})
-}
-
-func (bdb *BadgerDB) UpdateJsonWithTxn(ctx context.Context, txn *badger.Txn, key string,
-	delta map[string]any, ttl ...time.Duration) error {
-	fullMsgBytes, exist, err := bdb.GetWithTxn(ctx, txn, key)
-	if err != nil {
-		return err
-	}
-
-	var fullMsg map[string]any
-	if exist {
-		err = json.Unmarshal(fullMsgBytes, &fullMsg)
-		if err != nil {
-			bdb.log.Error("Failed to unmarshal existing JSON", zap.String("key", key), zap.Error(err))
-			return err
-		}
-	} else {
-		fullMsg = make(map[string]any)
-	}
-
-	maps.Copy(fullMsg, delta)
-
-	mergedBytes, err := json.Marshal(fullMsg)
-	if err != nil {
-		bdb.log.Error("Failed to marshal merged JSON", zap.String("key", key), zap.Error(err))
-		return err
-	}
-
-	return bdb.SetWithTxn(ctx, txn, key, mergedBytes, ttl...)
-}
-
-func (bdb *BadgerDB) UpdateProtobuf(ctx context.Context, key string, delta proto.Message,
-	ttl ...time.Duration) error {
-	return bdb.NewTransaction(ctx, false, func(ctx context.Context, txn *badger.Txn) error {
-		return bdb.UpdateProtobufWithTxn(ctx, txn, key, delta, ttl...)
-	})
-}
-
-func (bdb *BadgerDB) UpdateProtobufWithTxn(ctx context.Context, txn *badger.Txn, key string,
-	delta proto.Message, ttl ...time.Duration) error {
-	fullMsgBytes, exist, err := bdb.GetWithTxn(ctx, txn, key)
-	if err != nil {
-		return err
-	}
-
-	var mergedBytes []byte
-	if exist {
-		fullMsg := dynamicpb.NewMessage(delta.ProtoReflect().Descriptor())
-		err = proto.Unmarshal(fullMsgBytes, fullMsg)
-		if err != nil {
-			bdb.log.Error("Failed to unmarshal existing Protobuf", zap.String("key", key), zap.Error(err))
-			return err
-		}
-
-		err = types.MergeProtobufMessages(fullMsg, delta)
-		if err != nil {
-			bdb.log.Error("Failed to merge Protobuf messages", zap.String("key", key), zap.Error(err))
-			return err
-		}
-
-		mergedBytes, err = proto.Marshal(fullMsg)
-		if err != nil {
-			bdb.log.Error("Failed to marshal merged Protobuf", zap.String("key", key), zap.Error(err))
-			return err
-		}
-	} else {
-		mergedBytes, err = proto.Marshal(delta)
-		if err != nil {
-			bdb.log.Error("Failed to marshal delta Protobuf", zap.String("key", key), zap.Error(err))
-			return err
-		}
-	}
-	return bdb.SetWithTxn(ctx, txn, key, mergedBytes, ttl...)
-}
-
 // https://docs.hypermode.com/badger/quickstart#garbage-collection
 // https://github.com/hypermodeinc/dgraph/blob/e6980befe54103c67f353ffaa311345747ebb147/x/x.go#L1182-L1219
 // RunVlogGC runs value log gc on store. It runs GC unconditionally after every 10 minute.
 // TODO: P1: Is 10 mins is suitable interval?
-func (bdb *BadgerDB) RunVlogGC(ctx context.Context) {
+func (bdb *Badger) RunVlogGC(ctx context.Context) {
 	bdb.log.Info("Starting Badger value log GC routine")
 
 	ticker := time.NewTicker(10 * time.Minute)
@@ -825,7 +787,7 @@ func (bdb *BadgerDB) RunVlogGC(ctx context.Context) {
 	}
 }
 
-func (bdb *BadgerDB) runGC(ctx context.Context, lastSz *int64) {
+func (bdb *Badger) runGC(ctx context.Context, lastSz *int64) {
 	bdb.log.Info("Running Badger value log GC")
 	if bdb.managed {
 		// TODO: Where to add this logic?
@@ -836,7 +798,7 @@ func (bdb *BadgerDB) runGC(ctx context.Context, lastSz *int64) {
 
 	for err := error(nil); err == nil; {
 		// If a GC is successful, immediately run it again.
-		err = bdb.DB.RunValueLogGC(0.5)
+		err = bdb.db.RunValueLogGC(0.5)
 	}
 
 	abs := func(a, b int64) int64 {
@@ -846,7 +808,7 @@ func (bdb *BadgerDB) runGC(ctx context.Context, lastSz *int64) {
 		return b - a
 	}
 
-	_, sz := bdb.DB.Size()
+	_, sz := bdb.db.Size()
 	if abs(*lastSz, sz) > 512<<20 {
 		bdb.log.Info("Value log size", zap.String("size", humanize.Bytes(uint64(sz))),
 			zap.String("lastSize", humanize.Bytes(uint64(*lastSz))))
@@ -854,12 +816,4 @@ func (bdb *BadgerDB) runGC(ctx context.Context, lastSz *int64) {
 	}
 }
 
-func (bdb *BadgerDB) Close(ctx context.Context) {
-	if err := bdb.DB.Close(); err != nil {
-		bdb.log.Error("Error closing Badger DB instance", zap.Error(err))
-		return
-	}
-	bdb.log.Info("Closed Badger DB instance")
-}
-
-var _ Database = (*BadgerDB)(nil)
+var _ Database[*badger.Txn] = (*Badger)(nil)

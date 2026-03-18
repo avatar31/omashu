@@ -3,7 +3,6 @@ package omashu
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 
 	"go.uber.org/zap"
@@ -26,17 +25,12 @@ type Replicator interface {
 }
 
 type Replicate struct {
-	db  *BadgerDB
+	db  *Badger
 	log *zap.Logger
 }
 
-func NewReplicator(db Database, log *zap.Logger) (Replicator, error) {
-	bdb, ok := db.(*BadgerDB)
-	if !ok {
-		return nil, errors.New("invalid db instance")
-	}
-
-	return &Replicate{db: bdb, log: log}, nil
+func NewReplicator(db *Badger, log *zap.Logger) (Replicator, error) {
+	return &Replicate{db: db, log: log}, nil
 }
 
 // TakeSnapshot creates a full in-memory backup of the database.
@@ -56,7 +50,7 @@ func NewReplicator(db Database, log *zap.Logger) (Replicator, error) {
 // a bytes.Buffer eliminates the intermediate disk step entirely.
 func (r *Replicate) TakeSnapshot(ctx context.Context) (uint64, []byte, error) {
 	var buf bytes.Buffer
-	upto, err := r.db.DB.Backup(&buf, 0)
+	upto, err := r.db.GetBadger().Backup(&buf, 0)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -76,11 +70,11 @@ func (r *Replicate) TakeSnapshot(ctx context.Context) (uint64, []byte, error) {
 // DropAll() clears all data while keeping the DB instance open and usable,
 // providing the clean slate that Load() needs to faithfully reconstruct state.
 func (r *Replicate) Restore(ctx context.Context, data []byte) error {
-	if err := r.db.DB.DropAll(); err != nil {
+	if err := r.db.GetBadger().DropAll(); err != nil {
 		return fmt.Errorf("failed to drop existing data before snapshot restore: %w", err)
 	}
 
-	if err := r.db.DB.Load(bytes.NewReader(data), maxRestorePendingTxns); err != nil {
+	if err := r.db.GetBadger().Load(bytes.NewReader(data), maxRestorePendingTxns); err != nil {
 		return err
 	}
 	r.log.Info("Restored database from snapshot successfully")

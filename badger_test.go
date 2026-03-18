@@ -16,15 +16,15 @@ import (
 	"github.com/avatar31/omashu/utils"
 )
 
-func setupMockDB(managed bool) (*BadgerDB, func()) {
+func setupMockDB(managed bool) (*Badger, func()) {
 	ctx := context.Background()
-	var mockDB *BadgerDB
+	var mockDB *Badger
 	if managed {
 		bdb, _ := badger.OpenManaged(badger.DefaultOptions("").WithInMemory(true).WithLogger(nil))
-		mockDB = &BadgerDB{DB: bdb, managed: true}
+		mockDB = &Badger{db: bdb, managed: true}
 	} else {
 		bdb, _ := badger.Open(badger.DefaultOptions("").WithInMemory(true).WithLogger(nil))
-		mockDB = &BadgerDB{DB: bdb, managed: false}
+		mockDB = &Badger{db: bdb, managed: false}
 	}
 
 	data, err := os.ReadFile("../../../assets/db/fixtures.json")
@@ -49,7 +49,7 @@ func setupMockDB(managed bool) (*BadgerDB, func()) {
 	}
 
 	return mockDB, func() {
-		mockDB.DB.Close()
+		mockDB.db.Close()
 	}
 }
 
@@ -58,7 +58,7 @@ type bulkGetTC struct {
 	keys          []string
 	expectedCount int
 	expectedError bool
-	db            *BadgerDB
+	db            *Badger
 	validateValue func(*testing.T, map[string][]byte)
 }
 
@@ -154,7 +154,7 @@ type countTC struct {
 	name     string
 	prefix   string
 	expected int
-	db       *BadgerDB
+	db       *Badger
 }
 
 var countTestcases = []countTC{
@@ -213,7 +213,7 @@ type decrByTC struct {
 	delta         uint64
 	expected      uint64
 	expectedError bool
-	db            *BadgerDB
+	db            *Badger
 }
 
 var decrByTestcases = []decrByTC{
@@ -261,7 +261,7 @@ func TestDecrBy(t *testing.T) {
 
 	for _, tc := range tcList {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := tc.db.DecrBy(ctx, tc.key, tc.delta)
+			err := tc.db.DecrBy(ctx, tc.key, tc.delta)
 			if tc.expectedError {
 				assert.Error(t, err)
 			} else {
@@ -299,9 +299,8 @@ func TestDecrByWithTxn(t *testing.T) {
 
 	for _, tc := range tcList {
 		t.Run(tc.name, func(t *testing.T) {
-			err := tc.db.NewTransaction(ctx, false, func(ctx context.Context, txn *badger.Txn) error {
-				_, err := tc.db.DecrByWithTxn(ctx, txn, tc.key, tc.delta)
-				return err
+			err := tc.db.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
+				return tc.db.DecrByWithTxn(ctx, txn, tc.key, tc.delta)
 			})
 
 			if tc.expectedError {
@@ -324,7 +323,7 @@ type deleteTC struct {
 	name          string
 	key           string
 	expectedError bool
-	db            *BadgerDB
+	db            *Badger
 }
 
 var deleteTestcases = []deleteTC{
@@ -410,7 +409,7 @@ func TestDeleteWithTxn(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			existsBefore := tc.db.Exists(ctx, tc.key)
 
-			err := tc.db.NewTransaction(ctx, false, func(ctx context.Context, txn *badger.Txn) error {
+			err := tc.db.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
 				return tc.db.DeleteWithTxn(ctx, txn, tc.key)
 			})
 
@@ -433,8 +432,8 @@ type deleteByPrefixTC struct {
 	name           string
 	prefix         string
 	expectedError  bool
-	verifyDeletion func(context.Context, *testing.T, *BadgerDB, string)
-	db             *BadgerDB
+	verifyDeletion func(context.Context, *testing.T, *Badger, string)
+	db             *Badger
 }
 
 var deleteByPrefixTestcases = []deleteByPrefixTC{
@@ -442,7 +441,7 @@ var deleteByPrefixTestcases = []deleteByPrefixTC{
 		name:          "Delete nested prefix",
 		prefix:        "user:1:orders:",
 		expectedError: false,
-		verifyDeletion: func(ctx context.Context, t *testing.T, store *BadgerDB, prefix string) {
+		verifyDeletion: func(ctx context.Context, t *testing.T, store *Badger, prefix string) {
 			count := store.Count(ctx, prefix)
 			assert.Equal(t, 0, count, "All keys with prefix should be deleted")
 
@@ -454,7 +453,7 @@ var deleteByPrefixTestcases = []deleteByPrefixTC{
 		name:          "Delete by nonexisting prefix",
 		prefix:        "nonexistent:prefix:",
 		expectedError: false,
-		verifyDeletion: func(ctx context.Context, t *testing.T, store *BadgerDB, prefix string) {
+		verifyDeletion: func(ctx context.Context, t *testing.T, store *Badger, prefix string) {
 			count := store.Count(ctx, prefix)
 			assert.Equal(t, 0, count)
 		},
@@ -463,7 +462,7 @@ var deleteByPrefixTestcases = []deleteByPrefixTC{
 		name:          "Delete all users",
 		prefix:        "users:",
 		expectedError: false,
-		verifyDeletion: func(ctx context.Context, t *testing.T, store *BadgerDB, prefix string) {
+		verifyDeletion: func(ctx context.Context, t *testing.T, store *Badger, prefix string) {
 			count := store.Count(ctx, prefix)
 			assert.Equal(t, 0, count, "All users should be deleted")
 		},
@@ -526,7 +525,7 @@ func TestDeleteByPrefixWithTxn(t *testing.T) {
 
 	for _, tc := range tcList {
 		t.Run(tc.name, func(t *testing.T) {
-			err := tc.db.NewTransaction(ctx, false, func(ctx context.Context, txn *badger.Txn) error {
+			err := tc.db.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
 				tc.db.DeleteByPrefixWithTxn(ctx, txn, tc.prefix)
 				return nil
 			})
@@ -547,7 +546,7 @@ type existTC struct {
 	name     string
 	key      string
 	expected bool
-	db       *BadgerDB
+	db       *Badger
 }
 
 var existTestcases = []existTC{
@@ -595,14 +594,14 @@ func TestExists(t *testing.T) {
 	}
 }
 
-func TestGetBadgerInstance(t *testing.T) {
+func TestGetBadger(t *testing.T) {
 	mockKVStore, teardown := setupMockDB(false)
 	defer teardown()
 
 	t.Run("Get BadgerDB instance", func(t *testing.T) {
-		instance := mockKVStore.GetBadgerInstance()
+		instance := mockKVStore.GetBadger()
 		assert.NotNil(t, instance)
-		assert.Equal(t, mockKVStore.DB, instance)
+		assert.Equal(t, mockKVStore.db, instance)
 	})
 }
 
@@ -611,7 +610,7 @@ type getTC struct {
 	key           string
 	expectedExist bool
 	expectedError bool
-	db            *BadgerDB
+	db            *Badger
 	validateValue func(*testing.T, []byte)
 }
 
@@ -716,7 +715,7 @@ func TestGetWithTxn(t *testing.T) {
 			var value []byte
 			var exist bool
 
-			err := tc.db.NewTransaction(ctx, true, func(ctx context.Context, txn *badger.Txn) error {
+			err := tc.db.newReadonlyTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
 				var err error
 				value, exist, err = tc.db.GetWithTxn(ctx, txn, tc.key)
 				return err
@@ -741,7 +740,7 @@ type getByPrefix struct {
 	prefix        string
 	expectedCount int
 	expectedError bool
-	db            *BadgerDB
+	db            *Badger
 	validateValue func(*testing.T, map[string][]byte)
 }
 
@@ -829,7 +828,7 @@ type hasChildTC struct {
 	name     string
 	prefix   string
 	expected bool
-	db       *BadgerDB
+	db       *Badger
 }
 
 var hasChildTestcases = []hasChildTC{
@@ -883,7 +882,7 @@ type incrByTC struct {
 	delta         uint64
 	expected      uint64
 	expectedError bool
-	db            *BadgerDB
+	db            *Badger
 }
 
 var incrByTestcases = []incrByTC{
@@ -938,7 +937,7 @@ func TestIncrBy(t *testing.T) {
 
 	for _, tc := range tcList {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := tc.db.IncrBy(ctx, tc.key, tc.delta)
+			err := tc.db.IncrBy(ctx, tc.key, tc.delta)
 			if tc.expectedError {
 				assert.Error(t, err)
 			} else {
@@ -976,9 +975,8 @@ func TestIncrByWithTxn(t *testing.T) {
 
 	for _, tc := range tcList {
 		t.Run(tc.name, func(t *testing.T) {
-			err := tc.db.NewTransaction(ctx, false, func(ctx context.Context, txn *badger.Txn) error {
-				_, err := tc.db.IncrByWithTxn(ctx, txn, tc.key, tc.delta)
-				return err
+			err := tc.db.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
+				return tc.db.IncrByWithTxn(ctx, txn, tc.key, tc.delta)
 			})
 
 			if tc.expectedError {
@@ -1006,7 +1004,7 @@ func TestIterateByPrefix(t *testing.T) {
 
 	var testSuite = []struct {
 		prefix string
-		db     *BadgerDB
+		db     *Badger
 	}{
 		{
 			prefix: "",
@@ -1133,7 +1131,7 @@ func TestNewTransaction(t *testing.T) {
 
 	var testSuite = []struct {
 		prefix string
-		db     *BadgerDB
+		db     *Badger
 	}{
 		{
 			prefix: "",
@@ -1150,7 +1148,7 @@ func TestNewTransaction(t *testing.T) {
 			var value []byte
 			var exist bool
 
-			err := ts.db.NewTransaction(ctx, true, func(ctx context.Context, txn *badger.Txn) error {
+			err := ts.db.newReadonlyTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
 				var err error
 				value, exist, err = ts.db.GetWithTxn(ctx, txn, "users:1")
 				return err
@@ -1165,7 +1163,7 @@ func TestNewTransaction(t *testing.T) {
 			key := "test:txn:write"
 			setValue := []byte("transaction-test")
 
-			err := ts.db.NewTransaction(ctx, false, func(ctx context.Context, txn *badger.Txn) error {
+			err := ts.db.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
 				return ts.db.SetWithTxn(ctx, txn, key, setValue)
 			})
 
@@ -1182,7 +1180,7 @@ func TestNewTransaction(t *testing.T) {
 			key := "test:txn:rollback"
 			setValue := []byte("should-not-persist")
 
-			err := ts.db.NewTransaction(ctx, false, func(ctx context.Context, txn *badger.Txn) error {
+			err := ts.db.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
 				if err := ts.db.SetWithTxn(ctx, txn, key, setValue); err != nil {
 					return err
 				}
@@ -1201,7 +1199,7 @@ func TestNewTransaction(t *testing.T) {
 			keys := []string{"test:multi:txn:1", "test:multi:txn:2", "test:multi:txn:3"}
 			values := [][]byte{[]byte("val1"), []byte("val2"), []byte("val3")}
 
-			err := ts.db.NewTransaction(ctx, false, func(ctx context.Context, txn *badger.Txn) error {
+			err := ts.db.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
 				for i, key := range keys {
 					if err := ts.db.SetWithTxn(ctx, txn, key, values[i]); err != nil {
 						return err
@@ -1228,8 +1226,8 @@ type setTC struct {
 	key           string
 	value         []byte
 	expectedError bool
-	db            *BadgerDB
-	verifySet     func(context.Context, *testing.T, *BadgerDB, string)
+	db            *Badger
+	verifySet     func(context.Context, *testing.T, *Badger, string)
 }
 
 var setTestcases = []setTC{
@@ -1238,7 +1236,7 @@ var setTestcases = []setTC{
 		key:           "users:4",
 		value:         []byte(`{"id":4,"name":"Dave"}`),
 		expectedError: false,
-		verifySet: func(ctx context.Context, t *testing.T, store *BadgerDB, key string) {
+		verifySet: func(ctx context.Context, t *testing.T, store *Badger, key string) {
 			value, exist, err := store.Get(ctx, key)
 			assert.NoError(t, err)
 			assert.True(t, exist)
@@ -1253,7 +1251,7 @@ var setTestcases = []setTC{
 		key:           "users:1",
 		value:         []byte(`{"id":1,"name":"Alice Updated"}`),
 		expectedError: false,
-		verifySet: func(ctx context.Context, t *testing.T, store *BadgerDB, key string) {
+		verifySet: func(ctx context.Context, t *testing.T, store *Badger, key string) {
 			value, exist, err := store.Get(ctx, key)
 			assert.NoError(t, err)
 			assert.True(t, exist)
@@ -1267,7 +1265,7 @@ var setTestcases = []setTC{
 		key:           "users:4:ordersCount",
 		value:         utils.Uint64ToBytes(5),
 		expectedError: false,
-		verifySet: func(ctx context.Context, t *testing.T, store *BadgerDB, key string) {
+		verifySet: func(ctx context.Context, t *testing.T, store *Badger, key string) {
 			value, exist, err := store.Get(ctx, key)
 			assert.NoError(t, err)
 			assert.True(t, exist)
@@ -1280,7 +1278,7 @@ var setTestcases = []setTC{
 		key:           "test:empty",
 		value:         []byte{},
 		expectedError: false,
-		verifySet: func(ctx context.Context, t *testing.T, store *BadgerDB, key string) {
+		verifySet: func(ctx context.Context, t *testing.T, store *Badger, key string) {
 			value, exist, err := store.Get(ctx, key)
 			assert.NoError(t, err)
 			assert.True(t, exist)
@@ -1292,7 +1290,7 @@ var setTestcases = []setTC{
 		key:           "users:4:profile:settings:theme",
 		value:         []byte("dark"),
 		expectedError: false,
-		verifySet: func(ctx context.Context, t *testing.T, store *BadgerDB, key string) {
+		verifySet: func(ctx context.Context, t *testing.T, store *Badger, key string) {
 			value, exist, err := store.Get(ctx, key)
 			assert.NoError(t, err)
 			assert.True(t, exist)
@@ -1357,7 +1355,7 @@ func TestSetWithTxn(t *testing.T) {
 
 	for _, tc := range tcList {
 		t.Run(tc.name, func(t *testing.T) {
-			err := tc.db.NewTransaction(ctx, false, func(ctx context.Context, txn *badger.Txn) error {
+			err := tc.db.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
 				return tc.db.SetWithTxn(ctx, txn, tc.key, tc.value)
 			})
 
@@ -1379,8 +1377,8 @@ type updateJsonTC struct {
 	initialValue  []byte
 	delta         map[string]any
 	expectedError bool
-	db            *BadgerDB
-	verifyUpdate  func(context.Context, *testing.T, *BadgerDB, string)
+	db            *Badger
+	verifyUpdate  func(context.Context, *testing.T, *Badger, string)
 }
 
 var updateJsonTestcases = []updateJsonTC{
@@ -1390,7 +1388,7 @@ var updateJsonTestcases = []updateJsonTC{
 		initialValue:  []byte(`{"id":1,"name":"Alice"}`),
 		delta:         map[string]any{"age": 30},
 		expectedError: false,
-		verifyUpdate: func(ctx context.Context, t *testing.T, store *BadgerDB, key string) {
+		verifyUpdate: func(ctx context.Context, t *testing.T, store *Badger, key string) {
 			value, exist, err := store.Get(ctx, key)
 			assert.NoError(t, err)
 			assert.True(t, exist)
@@ -1408,7 +1406,7 @@ var updateJsonTestcases = []updateJsonTC{
 		initialValue:  []byte(`{"id":2,"name":"Bob","age":25}`),
 		delta:         map[string]any{"name": "Robert", "age": 26},
 		expectedError: false,
-		verifyUpdate: func(ctx context.Context, t *testing.T, store *BadgerDB, key string) {
+		verifyUpdate: func(ctx context.Context, t *testing.T, store *Badger, key string) {
 			value, exist, err := store.Get(ctx, key)
 			assert.NoError(t, err)
 			assert.True(t, exist)
@@ -1426,7 +1424,7 @@ var updateJsonTestcases = []updateJsonTC{
 		initialValue:  nil,
 		delta:         map[string]any{"id": 999, "name": "NewUser"},
 		expectedError: false,
-		verifyUpdate: func(ctx context.Context, t *testing.T, store *BadgerDB, key string) {
+		verifyUpdate: func(ctx context.Context, t *testing.T, store *Badger, key string) {
 			value, exist, err := store.Get(ctx, key)
 			assert.NoError(t, err)
 			assert.True(t, exist)
@@ -1443,7 +1441,7 @@ var updateJsonTestcases = []updateJsonTC{
 		initialValue:  []byte(`{"id":3,"name":"Charlie"}`),
 		delta:         map[string]any{},
 		expectedError: false,
-		verifyUpdate: func(ctx context.Context, t *testing.T, store *BadgerDB, key string) {
+		verifyUpdate: func(ctx context.Context, t *testing.T, store *Badger, key string) {
 			value, exist, err := store.Get(ctx, key)
 			assert.NoError(t, err)
 			assert.True(t, exist)
@@ -1460,7 +1458,7 @@ var updateJsonTestcases = []updateJsonTC{
 		initialValue:  []byte(`{"id":4,"name":"Dave"}`),
 		delta:         map[string]any{"address": map[string]any{"city": "NYC", "zip": "10001"}},
 		expectedError: false,
-		verifyUpdate: func(ctx context.Context, t *testing.T, store *BadgerDB, key string) {
+		verifyUpdate: func(ctx context.Context, t *testing.T, store *Badger, key string) {
 			value, exist, err := store.Get(ctx, key)
 			assert.NoError(t, err)
 			assert.True(t, exist)
@@ -1544,7 +1542,7 @@ func TestUpdateJsonWithTxn(t *testing.T) {
 				assert.NoError(t, err)
 			}
 
-			err := tc.db.NewTransaction(ctx, false, func(ctx context.Context, txn *badger.Txn) error {
+			err := tc.db.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
 				return tc.db.UpdateJsonWithTxn(ctx, txn, tc.key, tc.delta)
 			})
 
@@ -1566,8 +1564,8 @@ type updateProtobufTC struct {
 	initialValue  *types.Command
 	delta         *types.Command
 	expectedError bool
-	db            *BadgerDB
-	verifyUpdate  func(context.Context, *testing.T, *BadgerDB, string)
+	db            *Badger
+	verifyUpdate  func(context.Context, *testing.T, *Badger, string)
 }
 
 var updateProtobufTestcases = []updateProtobufTC{
@@ -1583,7 +1581,7 @@ var updateProtobufTestcases = []updateProtobufTC{
 			Ttl: durationpb.New(5 * time.Minute),
 		},
 		expectedError: false,
-		verifyUpdate: func(ctx context.Context, t *testing.T, store *BadgerDB, key string) {
+		verifyUpdate: func(ctx context.Context, t *testing.T, store *Badger, key string) {
 			value, exist, err := store.Get(ctx, key)
 			assert.NoError(t, err)
 			assert.True(t, exist)
@@ -1610,7 +1608,7 @@ var updateProtobufTestcases = []updateProtobufTC{
 			Prefix:          "counter:2",
 		},
 		expectedError: false,
-		verifyUpdate: func(ctx context.Context, t *testing.T, store *BadgerDB, key string) {
+		verifyUpdate: func(ctx context.Context, t *testing.T, store *Badger, key string) {
 			value, exist, err := store.Get(ctx, key)
 			assert.NoError(t, err)
 			assert.True(t, exist)
@@ -1632,7 +1630,7 @@ var updateProtobufTestcases = []updateProtobufTC{
 			Key:  "test:key",
 		},
 		expectedError: false,
-		verifyUpdate: func(ctx context.Context, t *testing.T, store *BadgerDB, key string) {
+		verifyUpdate: func(ctx context.Context, t *testing.T, store *Badger, key string) {
 			value, exist, err := store.Get(ctx, key)
 			assert.NoError(t, err)
 			assert.True(t, exist)
@@ -1654,7 +1652,7 @@ var updateProtobufTestcases = []updateProtobufTC{
 		},
 		delta:         &types.Command{},
 		expectedError: false,
-		verifyUpdate: func(ctx context.Context, t *testing.T, store *BadgerDB, key string) {
+		verifyUpdate: func(ctx context.Context, t *testing.T, store *Badger, key string) {
 			value, exist, err := store.Get(ctx, key)
 			assert.NoError(t, err)
 			assert.True(t, exist)
@@ -1682,7 +1680,7 @@ var updateProtobufTestcases = []updateProtobufTC{
 			},
 		},
 		expectedError: false,
-		verifyUpdate: func(ctx context.Context, t *testing.T, store *BadgerDB, key string) {
+		verifyUpdate: func(ctx context.Context, t *testing.T, store *Badger, key string) {
 			value, exist, err := store.Get(ctx, key)
 			assert.NoError(t, err)
 			assert.True(t, exist)
@@ -1768,7 +1766,7 @@ func TestUpdateProtobufWithTxn(t *testing.T) {
 				assert.NoError(t, err)
 			}
 
-			err := tc.db.NewTransaction(ctx, false, func(ctx context.Context, txn *badger.Txn) error {
+			err := tc.db.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
 				return tc.db.UpdateProtobufWithTxn(ctx, txn, tc.key, tc.delta)
 			})
 
@@ -1793,7 +1791,7 @@ func TestWriteBatch(t *testing.T) {
 
 	var testSuite = []struct {
 		prefix string
-		db     *BadgerDB
+		db     *Badger
 	}{
 		{
 			prefix: "",
@@ -1813,7 +1811,7 @@ func TestWriteBatch(t *testing.T) {
 				{Type: types.CommandType_SET, Key: "batch:3", Value: []byte("value3")},
 			}
 
-			err := ts.db.BatchWrite(ctx, ops)
+			err := ts.db.batchWrite(ctx, ops)
 			assert.NoError(t, err)
 
 			// Verify all values
@@ -1838,7 +1836,7 @@ func TestWriteBatch(t *testing.T) {
 				{Type: types.CommandType_DELETE, Key: "batch:del:2"},
 			}
 
-			err := ts.db.BatchWrite(ctx, ops)
+			err := ts.db.batchWrite(ctx, ops)
 			assert.NoError(t, err)
 
 			for _, op := range ops {
@@ -1868,7 +1866,7 @@ func TestWriteBatch(t *testing.T) {
 				{Type: types.CommandType_DECR_BY, Key: "batch:mixed:counter2", IncrOrDecrDelta: 5},
 			}
 
-			err := ts.db.BatchWrite(ctx, ops)
+			err := ts.db.batchWrite(ctx, ops)
 			assert.NoError(t, err)
 
 			// Verify set operations
@@ -1921,7 +1919,7 @@ func TestWriteBatch(t *testing.T) {
 				{Type: types.CommandType_DECR_BY, Key: "batch:mixederr:counter2", IncrOrDecrDelta: 5},
 			}
 
-			err := ts.db.BatchWrite(ctx, ops)
+			err := ts.db.batchWrite(ctx, ops)
 			assert.Error(t, err)
 
 			// Verify set operations
@@ -1949,19 +1947,19 @@ func TestWriteBatch(t *testing.T) {
 				ops[i] = &types.Command{Type: types.CommandType_SET, Key: "batch:overflow:" + string(rune('A'+i)), Value: []byte("value")}
 			}
 
-			err := ts.db.BatchWrite(ctx, ops)
+			err := ts.db.batchWrite(ctx, ops)
 			assert.Equal(t, err, ErrBatchTooBig)
 		})
 
 		t.Run(ts.prefix+"Write batch with empty operations", func(t *testing.T) {
 			ops := []*types.Command{}
 
-			err := ts.db.BatchWrite(ctx, ops)
+			err := ts.db.batchWrite(ctx, ops)
 			assert.NoError(t, err)
 		})
 
 		t.Run(ts.prefix+"Write batch with nil operations", func(t *testing.T) {
-			err := ts.db.BatchWrite(ctx, nil)
+			err := ts.db.batchWrite(ctx, nil)
 			assert.NoError(t, err)
 		})
 
@@ -1970,7 +1968,7 @@ func TestWriteBatch(t *testing.T) {
 				{Type: types.CommandType_UNKNOWN, Key: "invalid:op"},
 			}
 
-			err := ts.db.BatchWrite(ctx, ops)
+			err := ts.db.batchWrite(ctx, ops)
 			assert.Equal(t, err, ErrUnknownOp)
 		})
 	}

@@ -96,12 +96,12 @@ type TSO struct {
 	// of keys written and their latest commit counter).
 	committedTxns []committedTxn
 
-	db  *DBStore
+	db  *DistributedBadger
 	log *zap.Logger
 	mu  sync.Mutex
 }
 
-func newTSO(ctx context.Context, db *DBStore, log *zap.Logger) (*TSO, error) {
+func newTSO(ctx context.Context, db *DistributedBadger, log *zap.Logger) (*TSO, error) {
 	tso := &TSO{
 		current: newEmptyTimeStamp(),
 		saved:   newEmptyTimeStamp(),
