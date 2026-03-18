@@ -489,7 +489,6 @@ func (bdb *BadgerDB) Set(ctx context.Context, key string, value []byte, ttl ...t
 	})
 }
 
-// TODO: Can we avoid race condition by using Item metadata
 func (bdb *BadgerDB) SetWithTxn(ctx context.Context, txn *badger.Txn, key string, value []byte,
 	ttl ...time.Duration) error {
 	entry := badger.NewEntry([]byte(key), value)
@@ -497,8 +496,7 @@ func (bdb *BadgerDB) SetWithTxn(ctx context.Context, txn *badger.Txn, key string
 		entry.WithTTL(ttl[0])
 	}
 
-	// logger.GetLogger(ctx).Debugf("Writing data in database: %s", string(value))
-	return txn.SetEntry(entry) // TODO: Handle badger.ErrTxnTooBig. https://docs.hypermode.com/badger/quickstart#read-write-transactions
+	return txn.SetEntry(entry)
 }
 
 func (bdb *BadgerDB) Delete(ctx context.Context, key string) error {
@@ -807,7 +805,7 @@ func (bdb *BadgerDB) UpdateProtobufWithTxn(ctx context.Context, txn *badger.Txn,
 // https://docs.hypermode.com/badger/quickstart#garbage-collection
 // https://github.com/hypermodeinc/dgraph/blob/e6980befe54103c67f353ffaa311345747ebb147/x/x.go#L1182-L1219
 // RunVlogGC runs value log gc on store. It runs GC unconditionally after every 10 minute.
-// TODO: Is 10 mins is suitable interval?
+// TODO: P1: Is 10 mins is suitable interval?
 func (bdb *BadgerDB) RunVlogGC(ctx context.Context) {
 	bdb.log.Info("Starting Badger value log GC routine")
 
@@ -855,30 +853,6 @@ func (bdb *BadgerDB) runGC(ctx context.Context, lastSz *int64) {
 		lastSz = &sz
 	}
 }
-
-// func (bdb *BadgerDB) SubscribeToDBPublisher(ctx context.Context, errCh chan error) {
-// 	maches := make([]pb.Match, 0, len(subscribers))
-// 	for i := range subscribers {
-// 		maches = append(maches, pb.Match{Prefix: []byte(subscribers[i])})
-// 	}
-
-// 	err := bdb.DB.Subscribe(ctx, func(kv *badger.KVList) error {
-// 		for _, item := range kv.Kv {
-// 			log.Infof("Received notification - Key: %s, Value: %s", string(item.Key), string(item.Value))
-// 		}
-// 		return nil
-// 	}, maches)
-
-// 	if err != nil && !errors.Is(err, context.Canceled) {
-// 		log.WithError(err).Error("Failed to subscribe to DB publisher")
-// 		if errCh != nil {
-// 			errCh <- err
-// 		}
-// 		return
-// 	}
-
-// 	log.Info("Stopped DB publisher subscription")
-// }
 
 func (bdb *BadgerDB) Close(ctx context.Context) {
 	if err := bdb.DB.Close(); err != nil {

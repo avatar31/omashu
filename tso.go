@@ -85,6 +85,7 @@ type TSO struct {
 	// Used to determine which versions can be permanently discarded during compaction.
 	readMark *y.WaterMark
 
+	// readers tracks in-flight read timestamps so that DoneRead() can advance the readMark watermark.
 	readers       map[uint64]struct{}
 	lastCleanupTs uint64
 
@@ -100,7 +101,7 @@ type TSO struct {
 	mu  sync.Mutex
 }
 
-func newTSO(ctx context.Context, db *DBStore, logger *zap.Logger) (*TSO, error) {
+func newTSO(ctx context.Context, db *DBStore, log *zap.Logger) (*TSO, error) {
 	tso := &TSO{
 		current: newEmptyTimeStamp(),
 		saved:   newEmptyTimeStamp(),
@@ -109,8 +110,10 @@ func newTSO(ctx context.Context, db *DBStore, logger *zap.Logger) (*TSO, error) 
 		txnMark:  &y.WaterMark{Name: "badger.TxnTimestamp"},
 		closer:   z.NewCloser(2),
 
+		readers: make(map[uint64]struct{}),
+
 		db:  db,
-		log: logger,
+		log: log,
 	}
 	tso.readMark.Init(tso.closer)
 	tso.txnMark.Init(tso.closer)
@@ -204,6 +207,11 @@ func (tso *TSO) ReadTs(ctx context.Context) uint64 {
 	tso.mu.Lock()
 	readTs = tso.CurrentReadTs()
 	tso.readMark.Begin(readTs)
+
+	// Record readTs in the readers map so that DoneRead() can later call
+	// readMark.Done(). Without this, the readMark watermark never advances,
+	// cleanupCommittedTransactions() never fires, and committedTxns leaks.
+	tso.readers[readTs] = struct{}{}
 	tso.mu.Unlock()
 
 	start := time.Now()

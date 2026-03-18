@@ -56,7 +56,7 @@ func (c *Command) UnmarshalUpdateDelta() (any, error) {
 
 func NewSetCommand(ctx context.Context, key string, value []byte, ttl ...time.Duration) *Command {
 	c := &Command{
-		Id:    getCmdId(ctx),
+		Id:    getNewCmdId(),
 		Type:  CommandType_SET,
 		Key:   key,
 		Value: value,
@@ -71,7 +71,7 @@ func NewSetCommand(ctx context.Context, key string, value []byte, ttl ...time.Du
 func NewUpdateCommand(ctx context.Context, key string, delta []byte, deltaType UpdateDeltaType,
 	ttl ...time.Duration) *Command {
 	c := &Command{
-		Id:         getCmdId(ctx),
+		Id:         getNewCmdId(),
 		Type:       CommandType_UPDATE,
 		Key:        key,
 		Value:      delta,
@@ -86,7 +86,7 @@ func NewUpdateCommand(ctx context.Context, key string, delta []byte, deltaType U
 
 func NewDeleteCommand(ctx context.Context, key string) *Command {
 	return &Command{
-		Id:   getCmdId(ctx),
+		Id:   getNewCmdId(),
 		Type: CommandType_DELETE,
 		Key:  key,
 	}
@@ -94,7 +94,7 @@ func NewDeleteCommand(ctx context.Context, key string) *Command {
 
 func NewDeleteByPrefixCommand(ctx context.Context, prefix string) *Command {
 	return &Command{
-		Id:     getCmdId(ctx),
+		Id:     getNewCmdId(),
 		Type:   CommandType_DELETE_BY_PREFIX,
 		Prefix: prefix,
 	}
@@ -102,7 +102,7 @@ func NewDeleteByPrefixCommand(ctx context.Context, prefix string) *Command {
 
 func NewIncrByCommand(ctx context.Context, key string, delta uint64) *Command {
 	return &Command{
-		Id:              getCmdId(ctx),
+		Id:              getNewCmdId(),
 		Type:            CommandType_INCR_BY,
 		Key:             key,
 		IncrOrDecrDelta: delta,
@@ -111,7 +111,7 @@ func NewIncrByCommand(ctx context.Context, key string, delta uint64) *Command {
 
 func NewDecrByCommand(ctx context.Context, key string, delta uint64) *Command {
 	return &Command{
-		Id:              getCmdId(ctx),
+		Id:              getNewCmdId(),
 		Type:            CommandType_DECR_BY,
 		Key:             key,
 		IncrOrDecrDelta: delta,
@@ -120,7 +120,7 @@ func NewDecrByCommand(ctx context.Context, key string, delta uint64) *Command {
 
 func NewTransactionCommand(ctx context.Context) *Command {
 	return &Command{
-		Id:          getCmdId(ctx),
+		Id:          getNewCmdId(),
 		Type:        CommandType_TRANSACTION,
 		SubCommands: make([]*Command, 0),
 	}
@@ -128,7 +128,7 @@ func NewTransactionCommand(ctx context.Context) *Command {
 
 func NewBatchWriteCommand(ctx context.Context) *Command {
 	return &Command{
-		Id:          getCmdId(ctx),
+		Id:          getNewCmdId(),
 		Type:        CommandType_BATCH_WRITE,
 		SubCommands: make([]*Command, 0),
 	}
@@ -142,11 +142,6 @@ func DecodeCommand(data []byte) (*Command, error) {
 	return &c, nil
 }
 
-func getCmdId(ctx context.Context) string {
-	// traceId := ctx.Value(utils.CtxTraceIdKey)
-	// if id, ok := traceId.(string); ok {
-	// 	return id
-	// }
-
+func getNewCmdId() string {
 	return uuid.New().String()
 }

@@ -177,6 +177,16 @@ func (s *Storage) CreateSnapshot(index uint64, confState raftpb.ConfState, data 
 		return err
 	}
 
+	// Apply the new snapshot to in-memory storage so that Storage.Snapshot() returns
+	// up-to-date data. Without this, when raft needs to bring a lagging follower up-to-date
+	// it would call Storage.Snapshot(), get the stale old snapshot from memStorage, and send
+	// that outdated data — even though log entries up to this index are about to be compacted.
+	// The follower would receive a snapshot that is already behind the compaction point,
+	// causing it to loop forever asking for entries that no longer exist.
+	if err := s.memStorage.ApplySnapshot(snapshot); err != nil && err != raft.ErrSnapOutOfDate {
+		return fmt.Errorf("failed to apply snapshot to memory storage: %w", err)
+	}
+
 	if err := s.wal.Release(snapshot.Metadata.Index); err != nil {
 		return err
 	}

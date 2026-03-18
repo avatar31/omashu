@@ -79,7 +79,8 @@ import (
 // - Add support for advanced data recovery and disaster recovery strategies for the DBStore
 
 type DBStore struct {
-	proposals sync.Map
+	proposals            sync.Map
+	leaderChangeNotifier chan struct{}
 
 	db   Database
 	fsm  *FSM
@@ -87,6 +88,12 @@ type DBStore struct {
 	tso  *TSO
 	tm   *TxnManager
 	log  *zap.Logger
+
+	// mu guards tso, tm, and leaderChangeNotifier
+	mu sync.RWMutex
+
+	onLeaderChangeHook func(prevLeader, newLeader uint64)
+	onRemovedSelfHook  func()
 }
 
 const (
@@ -104,7 +111,11 @@ func Init(ctx context.Context, cfg *Config) (*DBStore, error) {
 	}
 
 	cfg.initializeLog()
-	store := &DBStore{log: cfg.Logger.With(zap.String("module", "omashu"))}
+	store := &DBStore{
+		log:                cfg.Logger,
+		onLeaderChangeHook: cfg.OnLeaderChange,
+		onRemovedSelfHook:  cfg.OnRemovedSelf,
+	}
 
 	db, err := initBadger(ctx, cfg, store.log)
 	if err != nil {
@@ -128,7 +139,10 @@ func Init(ctx context.Context, cfg *Config) (*DBStore, error) {
 	}
 
 	store.node = node
-	if store.IsLeader() {
+	store.node.WithLeaderChangeHook(store.onLeaderChange)
+	store.node.WithRemovedSelfHook(store.onRemovedSelf)
+
+	if store.isLeader() {
 		store.log.Info("Initializing TSO and TxnManager in Raft Leader node")
 
 		tso, err := newTSO(ctx, store, store.log)
@@ -137,9 +151,11 @@ func Init(ctx context.Context, cfg *Config) (*DBStore, error) {
 			return nil, err
 		}
 
+		store.mu.Lock()
 		store.tso = tso
-		store.fsm.SetTSO(tso)
-		store.tm = newTxnManager(store, store.log)
+		store.tm = newTxnManager(store, tso)
+		store.leaderChangeNotifier = make(chan struct{})
+		store.mu.Unlock()
 
 		go store.listenProposeResponses(ctx)
 	}
@@ -147,12 +163,80 @@ func Init(ctx context.Context, cfg *Config) (*DBStore, error) {
 	return store, nil
 }
 
-// IsLeader returns true if this node is the leader
-func (s *DBStore) IsLeader() bool {
-	return s.node.IsLeader()
+func (s *DBStore) onLeaderChange(ctx context.Context, prevLeader, newLeader uint64) {
+	if newLeader == s.node.id {
+		s.log.Info("This node is now the leader, initializing TSO and TxnManager")
+		tso, err := newTSO(ctx, s, s.log)
+		if err != nil {
+			s.Close(ctx)
+			s.log.Panic("Failed to initialize TSO on leadership gain", zap.Error(err))
+		}
+
+		// Hold the write-lock for the shortest possible window: just the pointer
+		// swaps. TSO construction (newTSO) reads from Badger and can be slow,
+		// so it must happen before acquiring the lock.
+		s.mu.Lock()
+		s.tso = tso
+		s.tm = newTxnManager(s, tso)
+		s.leaderChangeNotifier = make(chan struct{})
+		s.mu.Unlock()
+
+		go s.listenProposeResponses(ctx)
+	}
+
+	if prevLeader == s.node.id {
+		s.log.Info("This node is no longer the leader, stopping TSO and TxnManager")
+
+		s.mu.Lock()
+		prevTSO := s.tso
+		s.tso = nil
+		s.tm = nil
+		notifier := s.leaderChangeNotifier
+		s.leaderChangeNotifier = nil
+		s.mu.Unlock()
+
+		if prevTSO != nil {
+			prevTSO.Close()
+		}
+
+		if notifier != nil {
+			close(notifier)
+		}
+	}
+
+	if s.onLeaderChangeHook != nil {
+		s.onLeaderChangeHook(prevLeader, newLeader)
+	}
+}
+
+func (s *DBStore) onRemovedSelf() {
+	if s.onRemovedSelfHook != nil {
+		s.onRemovedSelfHook()
+	}
+}
+
+// getTM safely returns the active TxnManager under a read-lock.
+// Any leader-only operation must call this instead of accessing s.tm directly,
+// because onLeaderChange (running in node.run() goroutine) can nil s.tm at any time.
+func (s *DBStore) getTM() (*TxnManager, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.tm == nil {
+		return nil, ErrNotLeader
+	}
+	return s.tm, nil
 }
 
 func (s *DBStore) listenProposeResponses(ctx context.Context) {
+	// Capture the notifier channel for THIS leadership term under a read-lock.
+	// onLeaderChange replaces s.leaderChangeNotifier with a fresh channel each
+	// time leadership is gained. If we read s.leaderChangeNotifier directly
+	// inside the select without a captured reference, reading the field from
+	// two goroutines (this one and onLeaderChange's writer) is a data race.
+	s.mu.RLock()
+	notifier := s.leaderChangeNotifier
+	s.mu.RUnlock()
+
 	for {
 		select {
 		case r := <-s.node.ProposeRespNotifier():
@@ -165,6 +249,9 @@ func (s *DBStore) listenProposeResponses(ctx context.Context) {
 					s.log.Error("Proposal failed with error", zap.String("cmdID", r.CmdID), zap.Error(r.Err))
 				}
 			}
+		case <-notifier:
+			s.log.Info("Stopping listening ProposeResponses due to leadership change")
+			return
 		case <-ctx.Done():
 			s.log.Info("Stopping listening ProposeResponses as context is done")
 			return
@@ -173,7 +260,7 @@ func (s *DBStore) listenProposeResponses(ctx context.Context) {
 }
 
 func (s *DBStore) waitForReadState(ctx context.Context, key string) error {
-	if !s.IsLeader() {
+	if !s.isLeader() {
 		return nil
 	}
 
@@ -203,6 +290,11 @@ func (s *DBStore) waitForReadState(ctx context.Context, key string) error {
 	return nil
 }
 
+// isLeader returns true if this node is the leader
+func (s *DBStore) isLeader() bool {
+	return s.node.IsLeader()
+}
+
 func (s *DBStore) BulkGet(ctx context.Context, keys []string) (map[string][]byte, error) {
 	return s.fsm.GetDB().BulkGet(ctx, keys)
 }
@@ -212,7 +304,7 @@ func (s *DBStore) Count(ctx context.Context, prefix string) int {
 }
 
 func (s *DBStore) DecrBy(ctx context.Context, key string, delta uint64) error {
-	if !s.IsLeader() {
+	if !s.isLeader() {
 		return ErrNotLeader
 	}
 
@@ -222,7 +314,7 @@ func (s *DBStore) DecrBy(ctx context.Context, key string, delta uint64) error {
 }
 
 func (s *DBStore) Delete(ctx context.Context, key string) error {
-	if !s.IsLeader() {
+	if !s.isLeader() {
 		return ErrNotLeader
 	}
 
@@ -232,7 +324,7 @@ func (s *DBStore) Delete(ctx context.Context, key string) error {
 }
 
 func (s *DBStore) DeleteByPrefix(ctx context.Context, prefix string) error {
-	if !s.IsLeader() {
+	if !s.isLeader() {
 		return ErrNotLeader
 	}
 
@@ -301,7 +393,7 @@ func (s *DBStore) HasChild(ctx context.Context, prefix string) bool {
 }
 
 func (s *DBStore) IncrBy(ctx context.Context, key string, delta uint64) error {
-	if !s.IsLeader() {
+	if !s.isLeader() {
 		return ErrNotLeader
 	}
 
@@ -316,7 +408,7 @@ func (s *DBStore) IterateByPrefix(ctx context.Context, prefix, startCursor strin
 }
 
 func (s *DBStore) Set(ctx context.Context, key string, value []byte, ttl ...time.Duration) error {
-	if !s.IsLeader() {
+	if !s.isLeader() {
 		return ErrNotLeader
 	}
 
@@ -326,7 +418,7 @@ func (s *DBStore) Set(ctx context.Context, key string, value []byte, ttl ...time
 }
 
 func (s *DBStore) UpdateJson(ctx context.Context, key string, delta map[string]any, ttl ...time.Duration) error {
-	if !s.IsLeader() {
+	if !s.isLeader() {
 		return ErrNotLeader
 	}
 
@@ -337,7 +429,7 @@ func (s *DBStore) UpdateJson(ctx context.Context, key string, delta map[string]a
 
 func (s *DBStore) UpdateProtobuf(ctx context.Context, key string, deltaProtoMsg proto.Message,
 	ttl ...time.Duration) error {
-	if !s.IsLeader() {
+	if !s.isLeader() {
 		return ErrNotLeader
 	}
 
@@ -351,7 +443,7 @@ func (s *DBStore) UpdateProtobuf(ctx context.Context, key string, deltaProtoMsg 
 }
 
 func (s *DBStore) BatchWrite(ctx context.Context, addSubCommands func(*types.Command) *types.Command) error {
-	if !s.IsLeader() {
+	if !s.isLeader() {
 		return ErrNotLeader
 	}
 
@@ -367,7 +459,11 @@ func (s *DBStore) BatchWrite(ctx context.Context, addSubCommands func(*types.Com
 
 	// Getting readTs and commitTs for batch to find conflicts
 	// in the transactions running in same timeline
-	txn := s.tm.BeginTxn(ctx, true)
+	tm, err := s.getTM()
+	if err != nil {
+		return err
+	}
+	txn := tm.BeginTxn(ctx, true)
 	defer txn.Discard()
 
 	for _, subCmd := range cmd.SubCommands {
@@ -375,7 +471,7 @@ func (s *DBStore) BatchWrite(ctx context.Context, addSubCommands func(*types.Com
 		txn.writes = append(txn.writes, subCmd.Key)
 	}
 
-	_, err := txn.Commit()
+	_, err = txn.Commit()
 	if err != nil && !errors.Is(err, badger.ErrConflict) {
 		// We are not interested in conflict errors for batch write as we are only using
 		// txn to get timestamps and to find conflict in other transactions
@@ -389,14 +485,18 @@ func (s *DBStore) BatchWrite(ctx context.Context, addSubCommands func(*types.Com
 }
 
 func (s *DBStore) NewTransaction(ctx context.Context, performOps func(context.Context, *Txn) error) error {
-	if !s.IsLeader() {
+	if !s.isLeader() {
 		return ErrNotLeader
 	}
 
-	txn := s.tm.BeginTxn(ctx, true)
+	tm, err := s.getTM()
+	if err != nil {
+		return err
+	}
+	txn := tm.BeginTxn(ctx, true)
 	defer txn.Discard()
 
-	err := performOps(ctx, txn)
+	err = performOps(ctx, txn)
 	if err != nil {
 		s.log.Error("Failed to add subcommands to transaction", zap.Error(err))
 		return err
@@ -412,10 +512,17 @@ func (s *DBStore) NewTransaction(ctx context.Context, performOps func(context.Co
 }
 
 func (s *DBStore) proposeTxnSubCommand(ctx context.Context, performOps func(context.Context, *Txn) error) error {
-	txn := s.tm.BeginTxn(ctx, true)
+	// Re-check under lock: leadership may have changed between the !IsLeader()
+	// guard in the caller and reaching here (TOCTOU). getTM() is the
+	// authoritative, race-free gate for all leader-only mutations.
+	tm, err := s.getTM()
+	if err != nil {
+		return err
+	}
+	txn := tm.BeginTxn(ctx, true)
 	defer txn.Discard()
 
-	err := performOps(ctx, txn)
+	err = performOps(ctx, txn)
 	if err != nil {
 		s.log.Error("Failed to perform operations in transaction", zap.Error(err))
 		return err

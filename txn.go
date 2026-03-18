@@ -8,7 +8,6 @@ import (
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/avatar31/omashu/types"
@@ -16,20 +15,21 @@ import (
 
 type TxnManager struct {
 	db  *DBStore
-	log *zap.Logger
+	tso *TSO
 }
 
-func newTxnManager(db *DBStore, logger *zap.Logger) *TxnManager {
-	return &TxnManager{db: db, log: logger}
+func newTxnManager(db *DBStore, tso *TSO) *TxnManager {
+	return &TxnManager{db: db, tso: tso}
 }
 
 func (tm *TxnManager) BeginTxn(ctx context.Context, update bool) *Txn {
-	readTs := tm.db.tso.ReadTs(ctx)
+	readTs := tm.tso.ReadTs(ctx)
 	cmd := types.NewTransactionCommand(ctx)
 	cmd.ReadTs = readTs
 	return &Txn{
 		id:     uuid.New().String(),
 		readTs: readTs,
+		tso:    tm.tso,
 		db:     tm.db,
 		update: update,
 		cmd:    cmd,
@@ -44,6 +44,7 @@ type Txn struct {
 	id  string
 	cmd *types.Command
 	db  *DBStore
+	tso *TSO
 
 	readTs   uint64
 	commitTs uint64
@@ -81,7 +82,7 @@ func (txn *Txn) Commit() (*types.Command, error) {
 		return nil, ErrBatchTooBig
 	}
 
-	orc := txn.db.tso
+	orc := txn.tso
 
 	// Ensure that the order in which we get the commit timestamp is the same as
 	// the order in which we push these updates to the write channel. So, we
@@ -107,7 +108,7 @@ func (txn *Txn) Discard() {
 	}
 
 	txn.discarded = true
-	txn.db.tso.DoneRead(txn.readTs)
+	txn.tso.DoneRead(txn.readTs)
 }
 
 // DB Ops
