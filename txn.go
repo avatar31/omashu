@@ -22,8 +22,11 @@ func newTxnManager(db *DistributedBadger, tso *TSO) *TxnManager {
 	return &TxnManager{db: db, tso: tso}
 }
 
-func (tm *TxnManager) BeginTxn(ctx context.Context, update bool) *Txn {
-	readTs := tm.tso.ReadTs(ctx)
+func (tm *TxnManager) BeginTxn(ctx context.Context, update bool) (*Txn, error) {
+	readTs, err := tm.tso.ReadTs(ctx)
+	if err != nil {
+		return nil, err
+	}
 	cmd := types.NewTransactionCommand(ctx)
 	cmd.ReadTs = readTs
 	return &Txn{
@@ -37,7 +40,7 @@ func (tm *TxnManager) BeginTxn(ctx context.Context, update bool) *Txn {
 		conflictKeys: make(map[string]struct{}),
 		writes:       make([]string, 0),
 		reads:        make([]string, 0),
-	}
+	}, nil
 }
 
 type Txn struct {
@@ -91,14 +94,15 @@ func (txn *Txn) Commit() (*types.Command, error) {
 	orc.writeChLock.Lock()
 	defer orc.writeChLock.Unlock()
 
-	commitTs, conflict := orc.NewCommitTs(txn)
-	if conflict {
-		return nil, badger.ErrConflict
+	err := orc.Commit(txn, func(commitTs uint64) error {
+		txn.cmd.CommitTs = commitTs
+		txn.commitTs = commitTs
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
-	orc.doneCommit(commitTs)
-	txn.cmd.CommitTs = commitTs
-	txn.commitTs = commitTs
 	return txn.cmd, nil
 }
 

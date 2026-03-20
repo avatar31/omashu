@@ -360,7 +360,7 @@ func (node *Node) applySnapshotToFSM(ctx context.Context, snapshot raftpb.Snapsh
 		return fmt.Errorf("failed to restore FSM snapshot: %w", err)
 	}
 
-	// TODO: Do I need this here?
+	// TODO: P1: Do I need this here?
 	node.setAppliedIndex(snapshot.Metadata.Index)
 	// node.setCommittedIndex(snapshot.Metadata.Index)
 	// node.setTerm(snapshot.Metadata.Term)
@@ -518,7 +518,7 @@ func (node *Node) takeSnapshotIfNeeded(ctx context.Context, force bool) {
 	node.log.Info("Creating snapshot at appliedIndex", zap.Uint64("appliedIndex", appliedIndex),
 		zap.Uint64("tsoUpto", upto))
 
-	// TODO: Do I need to persist TSO upto in snapshot or storage?
+	// TODO: P0: Do I need to persist TSO upto in snapshot or storage?
 	if err := node.storage.CreateSnapshot(appliedIndex, confState, data); err != nil {
 		node.log.Error("Failed to save snapshot", zap.Error(err))
 		return
@@ -569,7 +569,7 @@ func (node *Node) ProposeRespNotifier() <-chan ProposeResp {
 }
 
 func (node *Node) setAppliedIndex(v uint64) {
-	node.log.Debug("Setting applied index", //zap.Stack("stack"),	// TODO: Remove debug log before production
+	node.log.Debug("Setting applied index",
 		zap.Uint64("oldIndex", node.getAppliedIndex()), zap.Uint64("newIndex", v))
 	node.appliedIndex.Store(v)
 }
@@ -579,7 +579,7 @@ func (node *Node) getAppliedIndex() uint64 {
 }
 
 // func (node *Node) setCommittedIndex(v uint64) {
-// 	node.log.Debug("Setting committed index", //zap.Stack("stack"),	// TODO: Remove debug log before production
+// 	node.log.Debug("Setting committed index",
 // 		zap.Uint64("oldIndex", node.getCommittedIndex()), zap.Uint64("newIndex", v))
 // 	node.committedIndex.Store(v)
 // }
@@ -589,7 +589,7 @@ func (node *Node) getAppliedIndex() uint64 {
 // }
 
 // func (node *Node) setTerm(v uint64) {
-// 	node.log.Debug("Setting Term", //zap.Stack("stack"),	// TODO: Remove debug log before production
+// 	node.log.Debug("Setting Term",
 // 		zap.Uint64("oldTerm", node.getTerm()), zap.Uint64("newTerm", v))
 // 	node.term.Store(v)
 // }

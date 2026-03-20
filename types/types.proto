@@ -29,7 +29,7 @@ message UpdateMeta {
 }
 
 message Command {
-    string id =1; 
+    string id = 1; 
     CommandType type = 2;
     string key = 3;
     bytes value = 4;

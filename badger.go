@@ -11,7 +11,6 @@ import (
 	"github.com/dustin/go-humanize"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/dynamicpb"
 
 	"github.com/avatar31/omashu/types"
 	"github.com/avatar31/omashu/utils"
@@ -21,29 +20,31 @@ const (
 	MaxBatchSize = 1000
 )
 
-func initBadger(ctx context.Context, managed bool, opts badger.Options, log *zap.Logger) (*Badger, error) {
+func initBadger(ctx context.Context, managed bool, cfg *Config) (*Badger, error) {
 	var db *badger.DB
 	var err error
 	if managed {
-		db, err = badger.OpenManaged(opts)
+		db, err = badger.OpenManaged(cfg.BadgerOptions)
 		if err != nil {
 			return nil, err
 		}
 	} else {
-		db, err = badger.Open(opts)
+		db, err = badger.Open(cfg.BadgerOptions)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	instance := &Badger{
-		db:      db,
-		managed: managed,
-		path:    opts.Dir,
-		log:     log,
+		db:             db,
+		managed:        managed,
+		path:           cfg.BadgerOptions.Dir,
+		log:            cfg.Logger,
+		gcInterval:     cfg.GCInterval,
+		gcDiscardRatio: cfg.GCDiscardRatio,
 	}
 
-	go instance.RunVlogGC(ctx)
+	go instance.runVlogGC(ctx)
 	return instance, nil
 }
 
@@ -314,6 +315,10 @@ func (bdb *Badger) IterateByPrefix(ctx context.Context, prefix, startCursor stri
 // DBWriteOps Interface
 
 func (bdb *Badger) DecrBy(ctx context.Context, key string, delta uint64) error {
+	if bdb.managed {
+		panic("operation not supported in managed db")
+	}
+
 	return bdb.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
 		return bdb.DecrByWithTxn(ctx, txn, key, delta)
 	})
@@ -340,6 +345,10 @@ func (bdb *Badger) DecrByWithTxn(ctx context.Context, txn *badger.Txn, key strin
 }
 
 func (bdb *Badger) IncrBy(ctx context.Context, key string, delta uint64) error {
+	if bdb.managed {
+		panic("operation not supported in managed db")
+	}
+
 	return bdb.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
 		return bdb.IncrByWithTxn(ctx, txn, key, delta)
 	})
@@ -361,9 +370,7 @@ func (bdb *Badger) IncrByWithTxn(ctx context.Context, txn *badger.Txn, key strin
 
 func (bdb *Badger) Set(ctx context.Context, key string, value []byte, ttl ...time.Duration) error {
 	if bdb.managed {
-		return bdb.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
-			return bdb.SetWithTxn(ctx, txn, key, value, ttl...)
-		})
+		panic("operation not supported in managed db")
 	}
 
 	return bdb.db.Update(func(txn *badger.Txn) error {
@@ -382,6 +389,10 @@ func (bdb *Badger) SetWithTxn(ctx context.Context, txn *badger.Txn, key string, 
 }
 
 func (bdb *Badger) UpdateJson(ctx context.Context, key string, delta map[string]any, ttl ...time.Duration) error {
+	if bdb.managed {
+		panic("operation not supported in managed db")
+	}
+
 	return bdb.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
 		return bdb.UpdateJsonWithTxn(ctx, txn, key, delta, ttl...)
 	})
@@ -418,6 +429,10 @@ func (bdb *Badger) UpdateJsonWithTxn(ctx context.Context, txn *badger.Txn, key s
 
 func (bdb *Badger) UpdateProtobuf(ctx context.Context, key string, delta proto.Message,
 	ttl ...time.Duration) error {
+	if bdb.managed {
+		panic("operation not supported in managed db")
+	}
+
 	return bdb.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
 		return bdb.UpdateProtobufWithTxn(ctx, txn, key, delta, ttl...)
 	})
@@ -432,20 +447,7 @@ func (bdb *Badger) UpdateProtobufWithTxn(ctx context.Context, txn *badger.Txn, k
 
 	var mergedBytes []byte
 	if exist {
-		fullMsg := dynamicpb.NewMessage(delta.ProtoReflect().Descriptor())
-		err = proto.Unmarshal(fullMsgBytes, fullMsg)
-		if err != nil {
-			bdb.log.Error("Failed to unmarshal existing Protobuf", zap.String("key", key), zap.Error(err))
-			return err
-		}
-
-		err = types.MergeProtobufMessages(fullMsg, delta)
-		if err != nil {
-			bdb.log.Error("Failed to merge Protobuf messages", zap.String("key", key), zap.Error(err))
-			return err
-		}
-
-		mergedBytes, err = proto.Marshal(fullMsg)
+		mergedBytes, err = types.MergeProtoDelta(fullMsgBytes, delta)
 		if err != nil {
 			bdb.log.Error("Failed to marshal merged Protobuf", zap.String("key", key), zap.Error(err))
 			return err
@@ -463,16 +465,13 @@ func (bdb *Badger) UpdateProtobufWithTxn(ctx context.Context, txn *badger.Txn, k
 // DBDeleteOps Interface
 
 func (bdb *Badger) Delete(ctx context.Context, key string) error {
-	var err error
 	if bdb.managed {
-		err = bdb.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
-			return bdb.DeleteWithTxn(ctx, txn, key)
-		})
-	} else {
-		err = bdb.db.Update(func(txn *badger.Txn) error {
-			return bdb.DeleteWithTxn(ctx, txn, key)
-		})
+		panic("operation not supported in managed db")
 	}
+
+	err := bdb.db.Update(func(txn *badger.Txn) error {
+		return bdb.DeleteWithTxn(ctx, txn, key)
+	})
 
 	if err == nil || err == badger.ErrKeyNotFound {
 		// Treat missing keys as non-errors
@@ -488,18 +487,14 @@ func (bdb *Badger) DeleteWithTxn(ctx context.Context, txn *badger.Txn, key strin
 }
 
 func (bdb *Badger) DeleteByPrefix(ctx context.Context, prefix string) error {
-	var err error
 	if bdb.managed {
-		err = bdb.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
-			bdb.DeleteByPrefixWithTxn(ctx, txn, prefix)
-			return nil
-		})
-	} else {
-		err = bdb.db.Update(func(txn *badger.Txn) error {
-			bdb.DeleteByPrefixWithTxn(ctx, txn, prefix)
-			return nil
-		})
+		panic("operation not supported in managed db")
 	}
+
+	err := bdb.db.Update(func(txn *badger.Txn) error {
+		bdb.DeleteByPrefixWithTxn(ctx, txn, prefix)
+		return nil
+	})
 	if err != nil {
 		bdb.log.Error("Error while deleting data in database", zap.String("prefix", prefix), zap.Error(err))
 		return err
@@ -764,41 +759,50 @@ func (bdb *Badger) batchWriteWithTxn(ctx context.Context, txn *badger.Txn, ops [
 	return nil
 }
 
+func (bdb *Badger) setOracle(oracle *TSO) {
+	if !bdb.managed {
+		panic("operation not supported")
+	}
+
+	bdb.oracle = oracle
+}
+
 // https://docs.hypermode.com/badger/quickstart#garbage-collection
 // https://github.com/hypermodeinc/dgraph/blob/e6980befe54103c67f353ffaa311345747ebb147/x/x.go#L1182-L1219
-// RunVlogGC runs value log gc on store. It runs GC unconditionally after every 10 minute.
-// TODO: P1: Is 10 mins is suitable interval?
-func (bdb *Badger) RunVlogGC(ctx context.Context) {
+// runVlogGC runs value log gc on store. It runs GC unconditionally after every configured interval.
+func (bdb *Badger) runVlogGC(ctx context.Context) {
 	bdb.log.Info("Starting Badger value log GC routine")
 
-	ticker := time.NewTicker(10 * time.Minute)
+	ticker := time.NewTicker(bdb.gcInterval)
 	defer ticker.Stop()
 
 	var lastSz int64
-	bdb.runGC(ctx, &lastSz)
 	for {
 		select {
 		case <-ctx.Done():
 			bdb.log.Info("Stopping Badger value log GC routine")
 			return
 		case <-ticker.C:
-			bdb.runGC(ctx, &lastSz)
+			bdb.runGC(&lastSz)
 		}
 	}
 }
 
-func (bdb *Badger) runGC(ctx context.Context, lastSz *int64) {
+func (bdb *Badger) runGC(lastSz *int64) {
 	bdb.log.Info("Running Badger value log GC")
 	if bdb.managed {
-		// TODO: Where to add this logic?
-		// discardTs := bdb.Oracle.ComputeDiscardTs()
-		// bdb.DB.SetDiscardTs(discardTs)
-		// log.Info("Setting discardTs to:", discardTs)
+		if bdb.oracle == nil {
+			bdb.log.Warn("Oracle is not set for managed Badger DB. Skipping running GC.")
+			return
+		}
+		discardTs := bdb.oracle.DiscardAt()
+		bdb.db.SetDiscardTs(discardTs)
+		bdb.log.Info("Setting discardTs", zap.Uint64("discardTs", discardTs))
 	}
 
 	for err := error(nil); err == nil; {
 		// If a GC is successful, immediately run it again.
-		err = bdb.db.RunValueLogGC(0.5)
+		err = bdb.db.RunValueLogGC(bdb.gcDiscardRatio)
 	}
 
 	abs := func(a, b int64) int64 {

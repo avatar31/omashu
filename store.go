@@ -85,10 +85,13 @@ type DistributedBadger struct {
 }
 
 type Badger struct {
-	managed bool
-	path    string
-	db      *badger.DB
-	log     *zap.Logger
+	managed        bool
+	path           string
+	gcInterval     time.Duration
+	gcDiscardRatio float64
+	db             *badger.DB
+	oracle         *TSO
+	log            *zap.Logger
 }
 
 func NewBadger(ctx context.Context, cfg *Config) (*Badger, error) {
@@ -97,7 +100,7 @@ func NewBadger(ctx context.Context, cfg *Config) (*Badger, error) {
 	}
 	cfg.initializeLog()
 
-	return initBadger(ctx, false, cfg.BadgerOptions, cfg.Logger)
+	return initBadger(ctx, false, cfg)
 }
 
 func NewDistributedBadger(ctx context.Context, cfg *Config) (*DistributedBadger, error) {
@@ -106,7 +109,7 @@ func NewDistributedBadger(ctx context.Context, cfg *Config) (*DistributedBadger,
 	}
 	cfg.initializeLog()
 
-	db, err := initBadger(ctx, true, cfg.BadgerOptions, cfg.Logger)
+	db, err := initBadger(ctx, true, cfg)
 	if err != nil {
 		return nil, err
 	}
