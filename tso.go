@@ -15,12 +15,17 @@ import (
 	"time"
 
 	"github.com/avatar31/omashu/utils"
+	"github.com/dgraph-io/badger/v4"
 	"github.com/dgraph-io/badger/v4/y"
 	"github.com/dgraph-io/ristretto/v2/z"
 	"go.uber.org/zap"
 )
 
+// Reference:
 // https://github.com/tikv/pd/wiki/Timestamp-Oracle
+// https://www.pingcap.com/blog/how-an-open-source-distributed-newsql-database-delivers-time-services/
+// https://github.com/tikv/pd/blob/master/pkg/tso/tso.go
+// https://github.com/dgraph-io/badger/blob/main/txn.go
 
 const (
 	LOGICAL_BITS            = 18
@@ -30,8 +35,28 @@ const (
 	persistentKey = "_tso_last_timestamp"
 )
 
+// timeStamp represents a hybrid logical clock timestamp with physical and logical components.
+// The physical component is the current time in milliseconds and the logical component is a
+// counter that increments when multiple timestamps are generated within the same millisecond.
+// ```
+// | Physical Time (ms) | Logical Counter |
+// ```
+//
+// Typical layout (64 bits):
+// ```
+// 63                           18 17        0
+// +------------------------------+-----------+
+// | physical time (ms)           | logical   |
+// +------------------------------+-----------+
+// ```
+//
+// Example:
+// ts = (physical_ms << 18) | logical
+//
+// This allows:
+// * Physical time ordering
+// * Multiple timestamps in the same millisecond
 type timeStamp struct {
-	sync.RWMutex
 	physical int64
 	logical  int64
 }
@@ -40,40 +65,62 @@ func newEmptyTimeStamp() *timeStamp {
 	return &timeStamp{physical: 0, logical: 0}
 }
 
+// Reset() sets the physical time to newTs and resets the logical counter to 0. It should be called
+// when the physical time advances to ensure that the logical counter starts fresh for the new millisecond.
 func (ts *timeStamp) Reset(newTs int64) {
-	ts.Lock()
-	defer ts.Unlock()
 	ts.physical = newTs
 	ts.logical = 0
 }
 
+// Incr() increments the logical counter by 1. It should be called when multiple timestamps are
+// generated within the same millisecond to ensure that each timestamp is unique.
+// If the logical counter exceeds MAX_LOGICAL, it indicates that too many timestamps have been
+// generated within the same millisecond and the system should wait for the next millisecond
+// before generating more timestamps.
 func (ts *timeStamp) Incr() {
-	ts.Lock()
-	defer ts.Unlock()
 	ts.logical += 1
 }
 
+// ExceedLogicalMax() checks if the logical counter has exceeded the maximum allowed value (MAX_LOGICAL).
 func (ts *timeStamp) ExceedLogicalMax() bool {
-	ts.RLock()
-	defer ts.RUnlock()
 	return ts.logical > MAX_LOGICAL
 }
 
+// Compose combines the physical and logical components of the timestamp into a single uint64 value.
 func (ts *timeStamp) Compose() uint64 {
-	ts.RLock()
-	defer ts.RUnlock()
 	return uint64((ts.physical << LOGICAL_BITS) | ts.logical)
 }
 
+func (ts *timeStamp) GetPhysicalTs() int64 {
+	return ts.physical
+}
+
+func (ts *timeStamp) GetLogicalTs() int64 {
+	return ts.logical
+}
+
+// committedTxn represents a transaction that has been committed with a specific timestamp (ts) and a set of conflict keys.
 type committedTxn struct {
 	ts uint64
 	// ConflictKeys Keeps track of the entries written at timestamp ts.
 	conflictKeys map[string]struct{}
 }
 
+// TSO (Timestamp Oracle) is responsible for generating unique, monotonically increasing timestamps
+// for transactions. It maintains the current timestamp, a saved upper bound timestamp, and tracks
+// in-flight read timestamps to manage transaction visibility and conflict detection.
+// The TSO ensures that transactions are assigned commit timestamps in a way that respects their read
+// timestamps and any conflicts with previously committed transactions. It also handles the persistence
+// of the upper bound timestamp to ensure durability across restarts and provides mechanisms for
+// cleaning up old committed transactions that are no longer relevant for conflict detection.
 type TSO struct {
+	// current is the current timestamp that is being allocated.
+	// It is updated whenever a new timestamp is allocated or when the physical time advances.
 	current *timeStamp
-	saved   *timeStamp
+
+	// saved is the upper bound timestamp that has been persisted to the database. To ensure that
+	// the next elected Leader can successfully calibrate the time after the current Leader is down.
+	saved *timeStamp
 
 	// writeChLock lock is for ensuring that transactions go to the write
 	// channel in the same order as their commit timestamps.
@@ -90,7 +137,8 @@ type TSO struct {
 	lastCleanupTs uint64
 
 	// closer is used to stop watermarks.
-	closer *z.Closer
+	closer       *z.Closer
+	stopNotifier chan struct{}
 
 	// committedTxns contains all committed writes (contains fingerprints
 	// of keys written and their latest commit counter).
@@ -101,19 +149,23 @@ type TSO struct {
 	mu  sync.Mutex
 }
 
+// newTSO() initializes a new TSO instance. It loads the last saved upper bound timestamp from the database,
+// calibrates the TSO clock if necessary, and starts a background goroutine to periodically update the upper bound timestamp.
+// It also initializes the read and transaction watermarks based on the current timestamp.
 func newTSO(ctx context.Context, db *DistributedBadger, log *zap.Logger) (*TSO, error) {
 	tso := &TSO{
 		current: newEmptyTimeStamp(),
 		saved:   newEmptyTimeStamp(),
 
-		readMark: &y.WaterMark{Name: "badger.PendingReads"},
-		txnMark:  &y.WaterMark{Name: "badger.TxnTimestamp"},
-		closer:   z.NewCloser(2),
+		readMark:     &y.WaterMark{Name: "badger.PendingReads"},
+		txnMark:      &y.WaterMark{Name: "badger.TxnTimestamp"},
+		closer:       z.NewCloser(2),
+		stopNotifier: make(chan struct{}),
 
 		readers: make(map[uint64]struct{}),
 
 		db:  db,
-		log: log,
+		log: log.With(zap.String("sub_module", "tso")),
 	}
 	tso.readMark.Init(tso.closer)
 	tso.txnMark.Init(tso.closer)
@@ -125,16 +177,19 @@ func newTSO(ctx context.Context, db *DistributedBadger, log *zap.Logger) (*TSO, 
 	}
 
 	if found {
-		tso.current.Reset(int64(utils.BytesToUint64(val)))
+		last := int64(utils.BytesToUint64(val))
+		now := time.Now().UnixMilli()
+		if now <= last {
+			now = last + 1
+		}
+
+		tso.current.Reset(now)
 		tso.calibrate()
 	} else {
 		tso.current.Reset(time.Now().UnixMilli())
 	}
 
-	// TODO: P0: Re-enable TSO window update
-	// if err := tso.UpdateWindow(ctx); err != nil {
-	// 	return nil, err
-	// }
+	go tso.windowUpdator(ctx)
 
 	lastIndex := tso.current.Compose()
 	tso.readMark.SetDoneUntil(lastIndex)
@@ -143,69 +198,137 @@ func newTSO(ctx context.Context, db *DistributedBadger, log *zap.Logger) (*TSO, 
 	return tso, nil
 }
 
+// windowUpdator() is a background goroutine that periodically checks if the current physical time
+// plus a predefined upper bound window exceeds the saved upper bound timestamp.
+func (tso *TSO) windowUpdator(ctx context.Context) {
+	if err := tso.UpdateWindow(ctx); err != nil {
+		tso.log.Error("Failed to update TSO window even after multiple retries", zap.Error(err))
+	}
+
+	tso.log.Info("TSO window updated successfully, starting ticker for periodic updates with interval",
+		zap.Duration("interval", defaultUpperBoundWindow))
+	ticker := time.NewTicker(defaultUpperBoundWindow)
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := tso.UpdateWindow(ctx); err != nil {
+				tso.log.Error("Failed to update TSO window", zap.Error(err))
+			}
+		case <-tso.stopNotifier:
+			tso.log.Info("Received stop signal, stopping TSO window updator")
+			ticker.Stop()
+			return
+		case <-ctx.Done():
+			ticker.Stop()
+			return
+		}
+	}
+}
+
+// calibrate() checks if the current physical time is behind the TSO's current physical timestamp.
+// If it is, it means that the system clock has moved backwards, which can lead to non-monotonic
+// timestamps being generated. To prevent this, the TSO will wait until the system clock catches
+// up to the current physical timestamp before allowing any new timestamps to be allocated.
+// This ensures that all generated timestamps are monotonically increasing and consistent with
+// the actual passage of time.
 func (tso *TSO) calibrate() {
 	now := time.Now().UnixMilli()
-	if now < tso.current.physical {
-		wait := time.Duration(tso.current.physical-now) * time.Millisecond
+	if now < tso.current.GetPhysicalTs() {
+		wait := time.Duration(tso.current.GetPhysicalTs()-now) * time.Millisecond
 		tso.log.Warn("Fencing TSO clock", zap.Int64("wait_ms", int64(wait/time.Millisecond)))
 		time.Sleep(wait)
 	}
 }
 
-func (tso *TSO) allocate() *timeStamp {
+// allocate() generates a new timestamp. It first checks if the physical time has advanced since
+// the last allocated timestamp and resets the logical counter if it has.
+func (tso *TSO) allocate() uint64 { // Must be called under tso.mu.Lock
 	now := time.Now().UnixMilli()
 
 	// Step 1: advance physical time if possible
-	if now > tso.current.physical {
+	if now > tso.current.GetPhysicalTs() {
 		tso.current.Reset(now)
 	}
 
-	// Step 2: handle logical overflow
-	if tso.current.ExceedLogicalMax() {
-		// need to wait for current physical millisecond
-		wait := time.Duration(1) * time.Millisecond
-		tso.log.Warn("TSO logical overflow, waiting for current millisecond",
-			zap.Int64("wait_ms", int64(wait/time.Millisecond)))
-		time.Sleep(wait)
-		tso.current.Reset(time.Now().UnixMilli())
+	// Step 2: Enforce upper bound safety. We must NOT generate timestamps beyond persisted window
+	if tso.current.GetPhysicalTs() >= tso.saved.GetPhysicalTs() {
+		tso.log.Panic("TSO reached upper bound, waiting for window update",
+				zap.Int64("current", tso.current.physical),
+				zap.Int64("saved", tso.saved.physical),
+			)
 	}
 
-	// Step 3: allocate timestamp
+	// Step 3: handle logical overflow
+	if tso.current.ExceedLogicalMax() {
+		tso.log.Warn("TSO logical overflow, waiting for physical time to advance")
+		for {
+			now = time.Now().UnixMilli()
+			if now > tso.current.GetPhysicalTs() {
+				tso.current.Reset(now)
+				break
+			}
+			// wait for physical time to advance
+			time.Sleep(time.Millisecond / 2)
+		}
+	}
+
+	// Step 4: allocate timestamp
 	tso.current.Incr()
-	return tso.current
+	return tso.current.Compose()
 }
 
+// UpdateWindow() checks if the current physical time plus a predefined upper bound window exceeds the
+// saved upper bound timestamp. If it does, it updates the upper bound timestamp in the database and
+// resets the saved timestamp to the new upper bound.
+// We are using a window to reduce the frequency of updates to the database, which can be expensive.
+// The TSO will only update the upper bound timestamp when the current time approaches the saved upper
+// bound, ensuring that there is always a buffer of time for generating new timestamps without needing
+// to immediately persist a new upper bound.
 func (tso *TSO) UpdateWindow(ctx context.Context) error {
 	tso.mu.Lock()
 	defer tso.mu.Unlock()
 
-	upperBound := tso.current.physical + defaultUpperBoundWindow.Milliseconds()
-	if upperBound <= tso.saved.physical {
+	upperBound := tso.current.GetPhysicalTs() + defaultUpperBoundWindow.Milliseconds()
+	if upperBound <= tso.saved.GetPhysicalTs() {
 		// no need to update
 		return nil
 	}
 
 	// persist the upper bound to DB
+	// TODO: P1: Use retry on failure due to transaction conflicts
 	err := tso.db.NewTransaction(ctx, func(ctx context.Context, txn *Txn) error {
-		return txn.IncrBy(ctx, persistentKey, uint64(upperBound))
+		return txn.Set(ctx, persistentKey, utils.Uint64ToBytes(uint64(upperBound)))
 	})
 	if err != nil {
 		tso.log.Error("Failed to update TSO upper bound in DB", zap.Error(err))
 		return err
 	}
 
-	tso.saved.physical = upperBound
+	tso.saved.Reset(upperBound)
+	tso.log.Info("Updated persistent key to new upperbound", zap.Int64("upperbound", upperBound))
 	return nil
 }
 
+// CurrentReadTs() returns the current read timestamp, which is the composed value of the current timeStamp.
 func (tso *TSO) CurrentReadTs() uint64 {
+	tso.mu.Lock()
+	defer tso.mu.Unlock()
+	return tso.currentReadTs()
+}
+
+func (tso *TSO) currentReadTs() uint64 {
 	return tso.current.Compose()
 }
 
-func (tso *TSO) ReadTs(ctx context.Context) uint64 {
+// ReadTs() returns a read timestamp for a transaction. It marks the read timestamp in the readMark watermark and
+// waits for all transactions that have been assigned a commit timestamp but have not yet completed their write
+// process to be visible. This ensures that any transaction that reads at this timestamp will see all committed
+// transactions up to this point, maintaining consistency.
+func (tso *TSO) ReadTs(ctx context.Context) (uint64, error) {
 	var readTs uint64
 	tso.mu.Lock()
-	readTs = tso.CurrentReadTs()
+	readTs = tso.currentReadTs()
 	tso.readMark.Begin(readTs)
 
 	// Record readTs in the readers map so that DoneRead() can later call
@@ -227,16 +350,31 @@ func (tso *TSO) ReadTs(ctx context.Context) uint64 {
 	err := tso.txnMark.WaitForMark(ctx, readTs)
 	if err != nil {
 		tso.readMark.Done(readTs)
-		tso.log.Panic("Failed to wait for txn mark in ReadTs", zap.Error(err), zap.Uint64("readTs", readTs))
+		tso.log.Error("Failed to wait for txn mark in ReadTs", zap.Error(err), zap.Uint64("readTs", readTs))
+		return 0, err
 	}
-	return readTs
+	return readTs, nil
 }
 
+// DiscardAt() returns the timestamp until which versions can be safely discarded during compaction.
+// It is determined by the readMark watermark, which tracks the oldest in-flight read timestamp.
+// Any versions with timestamps less than or equal to this value can be discarded without affecting
+// any active transactions, as they will not be visible to any ongoing reads.
 func (tso *TSO) DiscardAt() uint64 {
+	// TODO: P0: Implement this
+	// This will works only in leader node. Followers should query leader for discardTs
+	// Either we have to maintain the readMark watermark in followers as well and return min(allnodes)
+	// or we can have followers query the leader for the discardTs.
 	return tso.readMark.DoneUntil()
 }
 
-func (tso *TSO) NewCommitTs(txn *Txn) (uint64, bool) {
+// newCommitTs() generates a new commit timestamp for a transaction. It first checks for conflicts
+// with previously committed transactions based on the transaction's read timestamp and conflict keys.
+// If there are conflicts, it returns 0 and a boolean indicating that a conflict was detected.
+// If there are no conflicts, it marks the transaction's read timestamp as done, cleans up old committed
+// transactions, allocates a new commit timestamp, and records the committed transaction with
+// its conflict keys for future conflict detection.
+func (tso *TSO) newCommitTs(txn *Txn) (uint64, bool) {
 	tso.mu.Lock()
 	defer tso.mu.Unlock()
 
@@ -247,7 +385,7 @@ func (tso *TSO) NewCommitTs(txn *Txn) (uint64, bool) {
 	tso.doneRead(txn.readTs)
 	tso.cleanupCommittedTransactions()
 
-	ts := tso.allocate().Compose()
+	ts := tso.allocate()
 	tso.txnMark.Begin(ts)
 	tso.committedTxns = append(tso.committedTxns, committedTxn{
 		ts:           ts,
@@ -257,6 +395,26 @@ func (tso *TSO) NewCommitTs(txn *Txn) (uint64, bool) {
 	return ts, false
 }
 
+// Commit() is a helper function that generates a commit timestamp for a transaction and executes 
+// the provided function with that timestamp.
+func (tso *TSO) Commit(txn *Txn, fn func(ts uint64) error) error {
+	ts, conflict := tso.newCommitTs(txn)
+    if conflict {
+        return badger.ErrConflict
+    }
+
+    defer tso.DoneCommit(ts)
+	return fn(ts)
+}
+
+// hasConflict() checks if the given transaction has any conflicts with previously committed transactions.
+// A conflict occurs if there is a committed transaction with a commit timestamp greater than the
+// transaction's read timestamp that has written to any of the keys that the transaction has read.
+// This ensures that the transaction will not read stale data and maintains consistency.
+// TODO: P1: O(N²) worst-case
+// Improve later:
+// key → latest commit ts map
+// or bloom filters
 func (tso *TSO) hasConflict(txn *Txn) bool {
 	if len(txn.reads) == 0 {
 		return false
@@ -282,6 +440,13 @@ func (tso *TSO) hasConflict(txn *Txn) bool {
 	return false
 }
 
+// cleanupCommittedTransactions() removes committed transactions from the committedTxns slice that have
+// commit timestamps less than or equal to the maximum read timestamp of any in-flight transaction.
+// TODO: P1: Possibility of Memory growth risk
+// Improve:
+// Use bounded structure
+// Or index by timestamp
+// Or compact conflict keys (hash/fingerprint)
 func (tso *TSO) cleanupCommittedTransactions() { // Must be called under tso.mu.Lock
 	maxReadTs := tso.readMark.DoneUntil()
 
@@ -303,12 +468,18 @@ func (tso *TSO) cleanupCommittedTransactions() { // Must be called under tso.mu.
 	tso.committedTxns = tmp
 }
 
+// DoneRead() marks the given read timestamp as done in the readMark watermark and removes it from
+// the readers map. This should be called when a transaction that has read at this timestamp has
+// completed, allowing the TSO to advance the read watermark and potentially clean up old committed
+// transactions.
 func (tso *TSO) DoneRead(readTs uint64) {
 	tso.mu.Lock()
 	defer tso.mu.Unlock()
 	tso.doneRead(readTs)
 }
 
+// doneRead() is the internal implementation of DoneRead that assumes the caller has already
+// acquired the tso.mu lock.
 func (tso *TSO) doneRead(readTs uint64) {
 	if _, ok := tso.readers[readTs]; ok {
 		tso.readMark.Done(readTs)
@@ -316,10 +487,17 @@ func (tso *TSO) doneRead(readTs uint64) {
 	}
 }
 
-func (tso *TSO) doneCommit(cts uint64) {
+// DoneCommit() marks the given commit timestamp as done in the txnMark watermark. This should be
+// called when a transaction that has been assigned this commit timestamp has completed its write
+// process, allowing the TSO to advance the transaction watermark and ensure visibility of committed
+// transactions to new reads.
+func (tso *TSO) DoneCommit(cts uint64) {
 	tso.txnMark.Done(cts)
 }
 
+// Close() stops the TSO's watermarks and any background goroutines. It should be called when the
+// TSO is no longer needed to clean up resources.
 func (tso *TSO) Close() {
+	close(tso.stopNotifier)
 	tso.closer.Done()
 }

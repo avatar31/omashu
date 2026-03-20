@@ -87,54 +87,55 @@ const (
 )
 
 func initDistributed(ctx context.Context, db *Badger, cfg *Config) (*DistributedBadger, error) {
-	store := &DistributedBadger{
+	instance := &DistributedBadger{
 		log:                cfg.Logger,
 		onLeaderChangeHook: cfg.OnLeaderChange,
 		onRemovedSelfHook:  cfg.OnRemovedSelf,
 	}
 
-	fsm, err := newFSM(db, store.log)
+	fsm, err := newFSM(db, instance.log)
 	if err != nil {
 		return nil, err
 	}
-	store.fsm = fsm
+	instance.fsm = fsm
 
 	// Init Raft Node
-	node, err := newNode(cfg.RaftConfig.ID, cfg.RaftConfig.Nodename, cfg.RaftConfig.Peers, store.fsm, store.log)
+	node, err := newNode(cfg.RaftConfig.ID, cfg.RaftConfig.Nodename, cfg.RaftConfig.Peers, instance.fsm, instance.log)
 	if err != nil {
-		store.Close(ctx)
+		instance.Close(ctx)
 		return nil, err
 	}
 
 	err = node.Start(ctx, cfg)
 	if err != nil {
-		store.Close(ctx)
+		instance.Close(ctx)
 		return nil, err
 	}
 
-	store.node = node
-	store.node.WithLeaderChangeHook(store.onLeaderChange)
-	store.node.WithRemovedSelfHook(store.onRemovedSelf)
+	instance.node = node
+	instance.node.WithLeaderChangeHook(instance.onLeaderChange)
+	instance.node.WithRemovedSelfHook(instance.onRemovedSelf)
 
-	if store.isLeader() {
-		store.log.Info("Initializing TSO and TxnManager in Raft Leader node")
+	if instance.isLeader() {
+		instance.log.Info("Initializing TSO and TxnManager in Raft Leader node")
 
-		tso, err := newTSO(ctx, store, store.log)
+		tso, err := newTSO(ctx, instance, instance.log)
 		if err != nil {
-			store.Close(ctx)
+			instance.Close(ctx)
 			return nil, err
 		}
 
-		store.mu.Lock()
-		store.tso = tso
-		store.tm = newTxnManager(store, tso)
-		store.leaderChangeNotifier = make(chan struct{})
-		store.mu.Unlock()
+		instance.mu.Lock()
+		instance.tso = tso
+		instance.fsm.db.setOracle(tso)
+		instance.tm = newTxnManager(instance, tso)
+		instance.leaderChangeNotifier = make(chan struct{})
+		instance.mu.Unlock()
 
-		go store.listenProposeResponses(ctx)
+		go instance.listenProposeResponses(ctx)
 	}
 
-	return store, nil
+	return instance, nil
 }
 
 func (s *DistributedBadger) onLeaderChange(ctx context.Context, prevLeader, newLeader uint64) {
@@ -471,7 +472,11 @@ func (s *DistributedBadger) NewTransaction(ctx context.Context, performOps func(
 	if err != nil {
 		return err
 	}
-	txn := tm.BeginTxn(ctx, true)
+	txn, err := tm.BeginTxn(ctx, true)
+	if err != nil {
+		s.log.Error("Failed to begin transaction", zap.Error(err))
+		return err
+	}
 	defer txn.Discard()
 
 	err = performOps(ctx, txn)
@@ -526,7 +531,11 @@ func (s *DistributedBadger) batchWrite(ctx context.Context, addSubCommands func(
 	if err != nil {
 		return err
 	}
-	txn := tm.BeginTxn(ctx, true)
+	txn, err := tm.BeginTxn(ctx, true)
+	if err != nil {
+		s.log.Error("Failed to begin transaction for batch write", zap.Error(err))
+		return err
+	}
 	defer txn.Discard()
 
 	for _, subCmd := range cmd.SubCommands {
@@ -555,7 +564,11 @@ func (s *DistributedBadger) proposeTxnSubCommand(ctx context.Context, performOps
 	if err != nil {
 		return err
 	}
-	txn := tm.BeginTxn(ctx, true)
+	txn, err := tm.BeginTxn(ctx, true)
+	if err != nil {
+		s.log.Error("Failed to begin transaction", zap.Error(err))
+		return err
+	}
 	defer txn.Discard()
 
 	err = performOps(ctx, txn)

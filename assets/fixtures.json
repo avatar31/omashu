@@ -1,0 +1,48 @@
+{
+    "products:1": {
+        "id": 1,
+        "name": "Mobile",
+        "price": 21999.99,
+        "inStock": true,
+        "tags": ["trending"],
+        "addedAt": {
+            "ms": 1767976163
+        }
+    },
+    "products:2": {
+        "id": 2,
+        "name": "Laptop",
+        "inStock": true
+    },
+    "products:3": {
+        "id": 3,
+        "name": "Toy",
+        "inStock": false
+    },
+    "users:1": {
+        "id": 1,
+        "name": "Alice"
+    },
+    "users:2": {
+        "id": 2,
+        "name": "Bob"
+    },
+    "users:3": {
+        "id": 3,
+        "name": "Con"
+    },
+    "user:1:orders:1": {
+        "id": 1,
+        "productId": 1
+    },
+    "user:1:orders:2": {
+        "id": 2,
+        "productId": 2
+    },
+    "user:2:orders:3": {
+        "id": 3,
+        "productId": 3
+    },
+    "user:1:ordersCount": 2,
+    "user:2:ordersCount": 1
+}

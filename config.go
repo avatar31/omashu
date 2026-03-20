@@ -2,6 +2,7 @@ package omashu
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/dgraph-io/badger/v4"
 	"go.etcd.io/raft/v3"
@@ -24,10 +25,12 @@ type Config struct {
 	BaseDir string
 	Logger  *zap.Logger
 
-	BadgerOptions badger.Options
+	GCInterval     time.Duration
+	GCDiscardRatio float64
+	BadgerOptions  badger.Options
 
-	RaftConfig  *RaftConfig
-	Cluster     Cluster
+	RaftConfig *RaftConfig
+	Cluster    Cluster
 
 	// Hooks
 	OnLeaderChange func(prevLeader, newLeader uint64)

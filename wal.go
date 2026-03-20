@@ -71,7 +71,7 @@ func (w *Wal) Open(ctx context.Context) (*raftpb.Snapshot, *raftpb.HardState, []
 	}
 	w.wal = walInt
 
-	// TODO: Can we make use of metadata to store some useful info
+	// TODO: P2: Can we make use of metadata to store some useful info
 	_, hardState, entries, err := w.wal.ReadAll()
 	if err != nil {
 		w.log.Error("Error reading wal records", zap.Error(err))
@@ -80,7 +80,7 @@ func (w *Wal) Open(ctx context.Context) (*raftpb.Snapshot, *raftpb.HardState, []
 
 	w.log.Info("Current WAL state", zap.String("HardState", raft.DescribeHardState(hardState)))
 
-	// TODO: Do we need to make reading wal as async
+	// TODO: P1: Do we need to make reading wal as async
 	// rc.snapshotterReadyNotifier <- rc.snapshotter
 
 	return snapshot, &hardState, entries, nil
@@ -150,8 +150,6 @@ func (w *Wal) SaveSnap(snap *raftpb.Snapshot) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	w.log.Debug("Saving snapshot to wal storage", zap.Any("ready", *snap)) // TODO: Remove this log
-
 	// save the snapshot file before writing the snapshot to the wal.
 	// This makes it possible for the snapshot file to become orphaned, but prevents
 	// a WAL snapshot entry from having no corresponding snapshot file.
@@ -184,7 +182,7 @@ func (w *Wal) Release(index uint64) error {
 	return nil
 }
 
-// TODO: Analyze impact of Sync
+// TODO: P1: Analyze impact of Sync
 // Because I am getting "bad file descriptor" error on calling w.wal.Close()
 func (w *Wal) Sync() error {
 	w.mu.Lock()

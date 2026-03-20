@@ -50,7 +50,7 @@ func (tr *Transport) Start(ctx context.Context, cluster Cluster, node *Node, sna
 		Logger:      tr.log, //TODO: P0: Fix me
 		ServerStats: stats.NewServerStats("", ""),
 		LeaderStats: stats.NewLeaderStats(tr.log, fmt.Sprintf("%d", tr.id)),
-		Snapshotter: snapshotter, // TODO: Why do we need this?
+		Snapshotter: snapshotter, // TODO: P0: Why do we need this?
 	}
 
 	err := tr.raftTr.Start()

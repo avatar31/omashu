@@ -16,7 +16,7 @@ var (
 	descriptorsCache sync.Map // msgName -> *descriptorpb.FileDescriptorSet
 )
 
-// TODO:
+// TODO: P0
 // Common patterns:
 // Send descriptor set during handshake
 // Send schema separately
@@ -98,8 +98,7 @@ func MergeProtobufMessages(original, delta proto.Message) error {
 	return nil
 }
 
-// TODO: P0: Use this insted of Merge with dynamicpb
-func mergeProtoDelta(stored []byte, delta proto.Message) ([]byte, error) {
+func MergeProtoDelta(stored []byte, delta proto.Message) ([]byte, error) {
 	// Create empty message of same concrete type
 	base := proto.Clone(delta)
 	proto.Reset(base)
