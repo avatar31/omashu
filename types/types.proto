@@ -1,4 +1,10 @@
+/*
+ * SPDX-FileCopyrightText: © 2026 Sachin S
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 syntax="proto3";
+
 import "google/protobuf/descriptor.proto";
 import "google/protobuf/duration.proto";
 

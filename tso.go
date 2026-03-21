@@ -1,7 +1,6 @@
 /*
  * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
  * SPDX-FileCopyrightText: © 2026 Sachin S
- *
  * SPDX-License-Identifier: Apache-2.0
  *
  * Modified by Sachin S, 2026
