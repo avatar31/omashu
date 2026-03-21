@@ -1,14 +1,20 @@
+/*
+ * SPDX-FileCopyrightText: © 2026 Sachin S
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 package omashu
 
 import (
 	"fmt"
 	"time"
 
-	"github.com/avatar31/omashu/types"
 	"github.com/dgraph-io/badger/v4"
 	"go.etcd.io/raft/v3"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/types/descriptorpb"
+
+	"github.com/avatar31/omashu/types"
 )
 
 type SchemaType string
@@ -92,60 +98,4 @@ func (cfg *Config) validate(distributed bool) error {
 	}
 
 	return nil
-}
-
-func newLogger(module string, log *zap.Logger) raft.Logger {
-	return &zapBadgerLogger{log: log.With(zap.String("sub_module", module))}
-}
-
-type zapBadgerLogger struct {
-	log *zap.Logger
-}
-
-func (zl *zapBadgerLogger) Error(args ...any) {
-	zl.log.Error(fmt.Sprint(args...))
-}
-
-func (zl *zapBadgerLogger) Errorf(format string, args ...any) {
-	zl.log.Error(fmt.Sprintf(format, args...))
-}
-
-func (zl *zapBadgerLogger) Warning(args ...any) {
-	zl.log.Warn(fmt.Sprint(args...))
-}
-
-func (zl *zapBadgerLogger) Warningf(format string, args ...any) {
-	zl.log.Warn(fmt.Sprintf(format, args...))
-}
-
-func (zl *zapBadgerLogger) Info(args ...any) {
-	zl.log.Info(fmt.Sprint(args...))
-}
-
-func (zl *zapBadgerLogger) Infof(format string, args ...any) {
-	zl.log.Info(fmt.Sprintf(format, args...))
-}
-
-func (zl *zapBadgerLogger) Debug(args ...any) {
-	zl.log.Debug(fmt.Sprint(args...))
-}
-
-func (zl *zapBadgerLogger) Debugf(format string, args ...any) {
-	zl.log.Debug(fmt.Sprintf(format, args...))
-}
-
-func (zl *zapBadgerLogger) Fatal(args ...any) {
-	zl.log.Fatal(fmt.Sprint(args...))
-}
-
-func (zl *zapBadgerLogger) Fatalf(format string, args ...any) {
-	zl.log.Fatal(fmt.Sprintf(format, args...))
-}
-
-func (zl *zapBadgerLogger) Panic(args ...any) {
-	zl.log.Panic(fmt.Sprint(args...))
-}
-
-func (zl *zapBadgerLogger) Panicf(format string, args ...any) {
-	zl.log.Panic(fmt.Sprintf(format, args...))
 }

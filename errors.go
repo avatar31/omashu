@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: © 2026 Sachin S
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 package omashu
 
 import "errors"
