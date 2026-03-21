@@ -4,9 +4,18 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/avatar31/omashu/types"
 	"github.com/dgraph-io/badger/v4"
 	"go.etcd.io/raft/v3"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/types/descriptorpb"
+)
+
+type SchemaType string
+
+var (
+	SchemaTypeJson     SchemaType = "json"
+	SchemaTypeProtobuf SchemaType = "protobuf"
 )
 
 type Cluster interface {
@@ -20,6 +29,11 @@ type RaftConfig struct {
 	Peers    map[uint64]string
 }
 
+type SchemaConfig struct {
+	Type            SchemaType
+	ProtoSchemaList []*descriptorpb.FileDescriptorSet
+}
+
 type Config struct {
 	Name    string
 	BaseDir string
@@ -31,6 +45,8 @@ type Config struct {
 
 	RaftConfig *RaftConfig
 	Cluster    Cluster
+
+	SchemaConfig *SchemaConfig
 
 	// Hooks
 	OnLeaderChange func(prevLeader, newLeader uint64)
@@ -46,6 +62,18 @@ func (cfg *Config) validate(distributed bool) error {
 		return ErrMissingBaseDir
 	}
 
+	if cfg.SchemaConfig == nil {
+		return ErrMissingSchemaConfig
+	}
+
+	if cfg.SchemaConfig.Type == SchemaTypeProtobuf {
+		if len(cfg.SchemaConfig.ProtoSchemaList) == 0 {
+			return ErrMissingSchemaConfig
+		}
+
+		types.NewProtoDescriptorStore(cfg.SchemaConfig.ProtoSchemaList)
+	}
+
 	if distributed && cfg.RaftConfig == nil {
 		return ErrMissingRaftConf
 	}
@@ -55,17 +83,15 @@ func (cfg *Config) validate(distributed bool) error {
 	}
 
 	cfg.BadgerOptions = cfg.BadgerOptions.WithDir(fmt.Sprintf("%s/%s", cfg.BaseDir, DBSubDir))
-	return nil
-}
 
-func (cfg *Config) initializeLog() {
 	if cfg.Logger == nil {
 		cfg.BadgerOptions = cfg.BadgerOptions.WithLogger(nil)
 		cfg.Logger = zap.NewNop()
-		return
+	} else {
+		cfg.BadgerOptions = cfg.BadgerOptions.WithLogger(newLogger(fmt.Sprintf("%s.badger", cfg.Name), cfg.Logger))
 	}
 
-	cfg.BadgerOptions = cfg.BadgerOptions.WithLogger(newLogger(fmt.Sprintf("%s.badger", cfg.Name), cfg.Logger))
+	return nil
 }
 
 func newLogger(module string, log *zap.Logger) raft.Logger {

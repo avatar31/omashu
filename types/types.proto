@@ -11,9 +11,8 @@ enum CommandType {
     DECR_BY = 3;
     INCR_BY = 4;
     TRANSACTION = 5;
-    BATCH_WRITE = 6;
-    DELETE_BY_PREFIX = 7;
-    UPDATE = 8;
+    DELETE_BY_PREFIX = 6;
+    UPDATE = 7;
 }
 
 enum UpdateDeltaType {
@@ -24,7 +23,6 @@ enum UpdateDeltaType {
 
 message UpdateMeta {
     UpdateDeltaType update_delta_type = 1;
-    google.protobuf.FileDescriptorSet message_descriptors = 2;
     string message_name = 3;
 }
 

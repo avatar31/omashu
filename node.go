@@ -518,7 +518,7 @@ func (node *Node) takeSnapshotIfNeeded(ctx context.Context, force bool) {
 	node.log.Info("Creating snapshot at appliedIndex", zap.Uint64("appliedIndex", appliedIndex),
 		zap.Uint64("tsoUpto", upto))
 
-	// TODO: P0: Do I need to persist TSO upto in snapshot or storage?
+	// TODO: P1: Do I need to persist TSO upto in snapshot or storage?
 	if err := node.storage.CreateSnapshot(appliedIndex, confState, data); err != nil {
 		node.log.Error("Failed to save snapshot", zap.Error(err))
 		return

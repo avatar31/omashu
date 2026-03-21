@@ -91,14 +91,6 @@ func (ts *timeStamp) Compose() uint64 {
 	return uint64((ts.physical << LOGICAL_BITS) | ts.logical)
 }
 
-func (ts *timeStamp) GetPhysicalTs() int64 {
-	return ts.physical
-}
-
-func (ts *timeStamp) GetLogicalTs() int64 {
-	return ts.logical
-}
-
 // committedTxn represents a transaction that has been committed with a specific timestamp (ts) and a set of conflict keys.
 type committedTxn struct {
 	ts uint64
@@ -234,8 +226,8 @@ func (tso *TSO) windowUpdator(ctx context.Context) {
 // the actual passage of time.
 func (tso *TSO) calibrate() {
 	now := time.Now().UnixMilli()
-	if now < tso.current.GetPhysicalTs() {
-		wait := time.Duration(tso.current.GetPhysicalTs()-now) * time.Millisecond
+	if now < tso.current.physical {
+		wait := time.Duration(tso.current.physical-now) * time.Millisecond
 		tso.log.Warn("Fencing TSO clock", zap.Int64("wait_ms", int64(wait/time.Millisecond)))
 		time.Sleep(wait)
 	}
@@ -247,30 +239,43 @@ func (tso *TSO) allocate() uint64 { // Must be called under tso.mu.Lock
 	now := time.Now().UnixMilli()
 
 	// Step 1: advance physical time if possible
-	if now > tso.current.GetPhysicalTs() {
+	if now > tso.current.physical {
 		tso.current.Reset(now)
 	}
 
 	// Step 2: Enforce upper bound safety. We must NOT generate timestamps beyond persisted window
-	if tso.current.GetPhysicalTs() >= tso.saved.GetPhysicalTs() {
-		tso.log.Panic("TSO reached upper bound, waiting for window update",
-				zap.Int64("current", tso.current.physical),
-				zap.Int64("saved", tso.saved.physical),
-			)
+	if tso.current.physical >= tso.saved.physical {
+		tso.log.Error("TSO reached upper bound, waiting for window update",
+			zap.Int64("current", tso.current.physical), zap.Int64("saved", tso.saved.physical))
+		startTime := time.Now()
+		for {
+			// TODO: P1: Should we have a timeout here and return error if window is not updated for too long?
+			// This could be a sign of a problem with the TSO or the database.
+			now = time.Now().UnixMilli()
+			if now < tso.saved.physical {
+				tso.current.Reset(now)
+				break
+			}
+			// wait for window to be updated
+			time.Sleep(time.Millisecond / 2)
+		}
+		tso.log.Info("Window updated, resuming timestamp allocation", zap.Duration("wait_time", time.Since(startTime)))
 	}
 
 	// Step 3: handle logical overflow
 	if tso.current.ExceedLogicalMax() {
 		tso.log.Warn("TSO logical overflow, waiting for physical time to advance")
+		startTime := time.Now()
 		for {
 			now = time.Now().UnixMilli()
-			if now > tso.current.GetPhysicalTs() {
+			if now > tso.current.physical {
 				tso.current.Reset(now)
 				break
 			}
 			// wait for physical time to advance
 			time.Sleep(time.Millisecond / 2)
 		}
+		tso.log.Info("Physical time advanced, resuming timestamp allocation", zap.Duration("wait_time", time.Since(startTime)))
 	}
 
 	// Step 4: allocate timestamp
@@ -289,8 +294,8 @@ func (tso *TSO) UpdateWindow(ctx context.Context) error {
 	tso.mu.Lock()
 	defer tso.mu.Unlock()
 
-	upperBound := tso.current.GetPhysicalTs() + defaultUpperBoundWindow.Milliseconds()
-	if upperBound <= tso.saved.GetPhysicalTs() {
+	upperBound := tso.current.physical + defaultUpperBoundWindow.Milliseconds()
+	if upperBound <= tso.saved.physical {
 		// no need to update
 		return nil
 	}
