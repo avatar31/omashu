@@ -98,7 +98,6 @@ func NewBadger(ctx context.Context, cfg *Config) (*Badger, error) {
 	if err := cfg.validate(false); err != nil {
 		return nil, err
 	}
-	cfg.initializeLog()
 
 	return initBadger(ctx, false, cfg)
 }
@@ -107,7 +106,6 @@ func NewDistributedBadger(ctx context.Context, cfg *Config) (*DistributedBadger,
 	if err := cfg.validate(true); err != nil {
 		return nil, err
 	}
-	cfg.initializeLog()
 
 	db, err := initBadger(ctx, true, cfg)
 	if err != nil {

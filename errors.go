@@ -7,6 +7,7 @@ var (
 	ErrMissingRaftConf = errors.New("raft config required for distributed db")
 	ErrMissingCluster  = errors.New("cluster details are missing")
 	ErrMissingBaseDir  = errors.New("baseDir is missing")
+	ErrMissingSchemaConfig  = errors.New("schemaConfig is missing")
 
 	ErrNotLeader      = errors.New("operation can only be performed on leader node")
 	ErrProposeTimeout = errors.New("raft propose timeout")
@@ -16,4 +17,6 @@ var (
 
 	// ErrUnknownOp indicates that an unknown operation was encountered.
 	ErrUnknownOp = errors.New("unknown operation")
+
+	ErrUnknownProtoMsg = errors.New("unknown protobuf message type")
 )

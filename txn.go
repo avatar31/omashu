@@ -8,6 +8,7 @@ import (
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/avatar31/omashu/types"
@@ -16,10 +17,11 @@ import (
 type TxnManager struct {
 	db  *DistributedBadger
 	tso *TSO
+	log *zap.Logger
 }
 
-func newTxnManager(db *DistributedBadger, tso *TSO) *TxnManager {
-	return &TxnManager{db: db, tso: tso}
+func newTxnManager(db *DistributedBadger, tso *TSO, log *zap.Logger) *TxnManager {
+	return &TxnManager{db: db, tso: tso, log: log}
 }
 
 func (tm *TxnManager) BeginTxn(ctx context.Context, update bool) (*Txn, error) {
@@ -36,6 +38,7 @@ func (tm *TxnManager) BeginTxn(ctx context.Context, update bool) (*Txn, error) {
 		db:     tm.db,
 		update: update,
 		cmd:    cmd,
+		log:    tm.log,
 
 		conflictKeys: make(map[string]struct{}),
 		writes:       make([]string, 0),
@@ -48,6 +51,7 @@ type Txn struct {
 	cmd *types.Command
 	db  *DistributedBadger
 	tso *TSO
+	log *zap.Logger
 
 	readTs   uint64
 	commitTs uint64
@@ -185,7 +189,7 @@ func (txn *Txn) UpdateJson(ctx context.Context, key string, delta map[string]any
 		return err
 	}
 
-	txn.cmd.AddSubCommand(types.NewUpdateCommand(ctx, key, b, types.UpdateDeltaType_JSON, ttl...))
+	txn.cmd.AddSubCommand(types.NewUpdateCommand(ctx, key, b, types.UpdateDeltaType_JSON, "", ttl...))
 	return nil
 }
 
@@ -201,11 +205,18 @@ func (txn *Txn) UpdateProtobuf(ctx context.Context, key string, deltaProtoMsg pr
 		return err
 	}
 
-	subCmd := types.NewUpdateCommand(ctx, key, delta, types.UpdateDeltaType_PROTOBUF, ttl...)
-	messageName, fileDescriptor := types.GetFileDescriptorSet(deltaProtoMsg)
-	subCmd.UpdateMeta.MessageDescriptors = fileDescriptor
-	subCmd.UpdateMeta.MessageName = messageName
+	msgName := string(proto.MessageName(deltaProtoMsg))
+	valid, err := types.GetProtoDescriptorStore().IsValidMessage(msgName)
+	if err != nil {
+		txn.log.Error("Error validating protobuf message", zap.String("messageName", msgName), zap.Error(err))
+		return ErrUnknownProtoMsg
+	}
 
+	if !valid {
+		return ErrUnknownProtoMsg
+	}
+
+	subCmd := types.NewUpdateCommand(ctx, key, delta, types.UpdateDeltaType_PROTOBUF, msgName, ttl...)
 	txn.cmd.AddSubCommand(subCmd)
 	return nil
 }

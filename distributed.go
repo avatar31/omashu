@@ -2,7 +2,6 @@ package omashu
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -128,7 +127,7 @@ func initDistributed(ctx context.Context, db *Badger, cfg *Config) (*Distributed
 		instance.mu.Lock()
 		instance.tso = tso
 		instance.fsm.db.setOracle(tso)
-		instance.tm = newTxnManager(instance, tso)
+		instance.tm = newTxnManager(instance, tso, instance.log)
 		instance.leaderChangeNotifier = make(chan struct{})
 		instance.mu.Unlock()
 
@@ -152,7 +151,7 @@ func (s *DistributedBadger) onLeaderChange(ctx context.Context, prevLeader, newL
 		// so it must happen before acquiring the lock.
 		s.mu.Lock()
 		s.tso = tso
-		s.tm = newTxnManager(s, tso)
+		s.tm = newTxnManager(s, tso, s.log)
 		s.leaderChangeNotifier = make(chan struct{})
 		s.mu.Unlock()
 
@@ -509,52 +508,6 @@ func (s *DistributedBadger) Close(ctx context.Context) {
 }
 
 // Helpers
-
-func (s *DistributedBadger) batchWrite(ctx context.Context, addSubCommands func(*types.Command) *types.Command) error {
-	if !s.isLeader() {
-		return ErrNotLeader
-	}
-
-	cmd := types.NewBatchWriteCommand(ctx)
-	addSubCommands(cmd)
-	if len(cmd.SubCommands) == 0 {
-		return nil
-	}
-
-	if len(cmd.SubCommands) > MaxBatchSize {
-		return ErrBatchTooBig
-	}
-
-	// Getting readTs and commitTs for batch to find conflicts
-	// in the transactions running in same timeline
-	tm, err := s.getTM()
-	if err != nil {
-		return err
-	}
-	txn, err := tm.BeginTxn(ctx, true)
-	if err != nil {
-		s.log.Error("Failed to begin transaction for batch write", zap.Error(err))
-		return err
-	}
-	defer txn.Discard()
-
-	for _, subCmd := range cmd.SubCommands {
-		txn.conflictKeys[subCmd.Key] = struct{}{}
-		txn.writes = append(txn.writes, subCmd.Key)
-	}
-
-	_, err = txn.Commit()
-	if err != nil && !errors.Is(err, badger.ErrConflict) {
-		// We are not interested in conflict errors for batch write as we are only using
-		// txn to get timestamps and to find conflict in other transactions
-		s.log.Error("Failed to get timestamps for batch write", zap.Error(err))
-		return err
-	}
-
-	cmd.ReadTs = txn.readTs
-	cmd.CommitTs = txn.commitTs
-	return s.proposeAndWait(cmd)
-}
 
 func (s *DistributedBadger) proposeTxnSubCommand(ctx context.Context, performOps func(context.Context, *Txn) error) error {
 	// Re-check under lock: leadership may have changed between the !IsLeader()

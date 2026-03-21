@@ -21,6 +21,8 @@ type Replicator interface {
 	// TakeSnapshot captures a complete, consistent backup of the database and
 	// returns the highest version included along with the serialised bytes.
 	TakeSnapshot(ctx context.Context) (uint64, []byte, error)
+
+	// Restore replaces the entire database with the contents of a raft snapshot.
 	Restore(ctx context.Context, data []byte) error
 }
 

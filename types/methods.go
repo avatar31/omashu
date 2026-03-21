@@ -18,7 +18,6 @@ func (c *Command) Encode() ([]byte, error) {
 func (c *Command) AddSubCommand(subCmd *Command) {
 	if subCmd == nil ||
 		subCmd.Type == CommandType_TRANSACTION ||
-		subCmd.Type == CommandType_BATCH_WRITE ||
 		subCmd.Type == CommandType_DELETE_BY_PREFIX {
 	}
 
@@ -41,7 +40,7 @@ func (c *Command) UnmarshalUpdateDelta() (any, error) {
 		return deltaJson, nil
 	}
 
-	msg, err := GetMessageFromDescriptorSet(c.UpdateMeta.MessageName, c.UpdateMeta.MessageDescriptors)
+	msg, err := GetProtoDescriptorStore().GetMessageFromDescriptorSet(c.UpdateMeta.MessageName)
 	if err != nil {
 		return nil, err
 	}
@@ -68,14 +67,14 @@ func NewSetCommand(ctx context.Context, key string, value []byte, ttl ...time.Du
 	return c
 }
 
-func NewUpdateCommand(ctx context.Context, key string, delta []byte, deltaType UpdateDeltaType,
+func NewUpdateCommand(ctx context.Context, key string, delta []byte, deltaType UpdateDeltaType, msgName string,
 	ttl ...time.Duration) *Command {
 	c := &Command{
 		Id:         getNewCmdId(),
 		Type:       CommandType_UPDATE,
 		Key:        key,
 		Value:      delta,
-		UpdateMeta: &UpdateMeta{UpdateDeltaType: deltaType},
+		UpdateMeta: &UpdateMeta{UpdateDeltaType: deltaType, MessageName: msgName},
 	}
 
 	if len(ttl) > 0 {
@@ -122,14 +121,6 @@ func NewTransactionCommand(ctx context.Context) *Command {
 	return &Command{
 		Id:          getNewCmdId(),
 		Type:        CommandType_TRANSACTION,
-		SubCommands: make([]*Command, 0),
-	}
-}
-
-func NewBatchWriteCommand(ctx context.Context) *Command {
-	return &Command{
-		Id:          getNewCmdId(),
-		Type:        CommandType_BATCH_WRITE,
 		SubCommands: make([]*Command, 0),
 	}
 }

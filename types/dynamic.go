@@ -2,77 +2,84 @@ package types
 
 import (
 	"errors"
-	reflect "reflect"
+	"reflect"
 	"sync"
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
 var (
-	descriptorsCache sync.Map // msgName -> *descriptorpb.FileDescriptorSet
+	descriptorsCache *protoDescriptorStore
+	once             sync.Once
 )
 
-// TODO: P0
-// Common patterns:
-// Send descriptor set during handshake
-// Send schema separately
-// Reference schema by ID afterward
-
-func GetFileDescriptorSet(msg proto.Message) (string, *descriptorpb.FileDescriptorSet) {
-	// Extract descriptor
-	md := msg.ProtoReflect().Descriptor()
-	msgName := string(md.FullName())
-
-	if v, ok := descriptorsCache.Load(msgName); ok {
-		return msgName, v.(*descriptorpb.FileDescriptorSet)
-	}
-
-	visited := make(map[string]bool)
-	var files []*descriptorpb.FileDescriptorProto
-
-	var visit func(fd protoreflect.FileDescriptor)
-	visit = func(fd protoreflect.FileDescriptor) {
-		path := fd.Path()
-		if visited[path] {
-			return
-		}
-		visited[path] = true
-
-		// Visit imports first
-		imports := fd.Imports()
-		for i := 0; i < imports.Len(); i++ {
-			visit(imports.Get(i))
-		}
-
-		// Convert to FileDescriptorProto
-		files = append(files, protodesc.ToFileDescriptorProto(fd))
-	}
-
-	// Recursive visit
-	visit(md.ParentFile())
-
-	descriptors := &descriptorpb.FileDescriptorSet{File: files}
-	descriptorsCache.Store(msgName, descriptors)
-	return msgName, descriptors
+type protoDescriptorStore struct {
+	store []*descriptorpb.FileDescriptorSet
 }
 
-func GetMessageFromDescriptorSet(msgName string, descriptorSet *descriptorpb.FileDescriptorSet) (proto.Message, error) {
-	// Load descriptors
-	files, err := protodesc.NewFiles(descriptorSet)
-	if err != nil {
-		return nil, err
+func NewProtoDescriptorStore(set []*descriptorpb.FileDescriptorSet) {
+	once.Do(func() {
+		descriptorsCache = &protoDescriptorStore{store: set}
+	})
+}
+
+func GetProtoDescriptorStore() *protoDescriptorStore {
+	return descriptorsCache
+}
+
+func (p *protoDescriptorStore) IsValidMessage(msgName string) (bool, error) {
+	for _, set := range p.store {
+		// Load descriptors
+		files, err := protodesc.NewFiles(set)
+		if err != nil {
+			return false, err
+		}
+
+		desc, err := files.FindDescriptorByName(protoreflect.FullName(msgName))
+		if err != nil {
+			if errors.Is(err, protoregistry.NotFound) {
+				continue
+			}
+			return false, err
+		}
+
+		_, ok := desc.(protoreflect.MessageDescriptor)
+		if ok {
+			return true, nil
+		}
 	}
 
-	desc, err := files.FindDescriptorByName(
-		protoreflect.FullName(msgName),
-	)
+	return false, nil
+}
 
-	md := desc.(protoreflect.MessageDescriptor)
-	return dynamicpb.NewMessage(md), nil
+func (p *protoDescriptorStore) GetMessageFromDescriptorSet(msgName string) (proto.Message, error) {
+	for _, set := range p.store {
+		// Load descriptors
+		files, err := protodesc.NewFiles(set)
+		if err != nil {
+			return nil, err
+		}
+
+		desc, err := files.FindDescriptorByName(protoreflect.FullName(msgName))
+		if err != nil {
+			if errors.Is(err, protoregistry.NotFound) {
+				continue
+			}
+			return nil, err
+		}
+
+		md, ok := desc.(protoreflect.MessageDescriptor)
+		if ok {
+			return dynamicpb.NewMessage(md), nil
+		}
+	}
+
+	return nil, protoregistry.NotFound
 }
 
 func MergeProtobufMessages(original, delta proto.Message) error {

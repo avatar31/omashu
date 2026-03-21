@@ -39,8 +39,6 @@ func (fsm *FSM) Apply(ctx context.Context, data []byte) error {
 		applyErr = fsm.applyDelete(ctx, c)
 	case types.CommandType_DELETE_BY_PREFIX:
 		applyErr = fsm.applyDeleteByPrefix(ctx, c)
-	case types.CommandType_BATCH_WRITE:
-		applyErr = fsm.applyBatchWrite(ctx, c)
 	case types.CommandType_INCR_BY:
 		applyErr = fsm.applyIncrBy(ctx, c)
 	case types.CommandType_DECR_BY:
@@ -116,12 +114,6 @@ func (fsm *FSM) applyDeleteByPrefix(ctx context.Context, cmd *types.Command) err
 	return fsm.db.newTransactionAt(ctx, cmd.ReadTs, cmd.CommitTs, func(ctx context.Context, txn *badger.Txn) error {
 		fsm.db.DeleteByPrefixWithTxn(ctx, txn, cmd.Prefix)
 		return nil
-	})
-}
-
-func (fsm *FSM) applyBatchWrite(ctx context.Context, cmd *types.Command) error {
-	return fsm.db.newTransactionAt(ctx, cmd.ReadTs, cmd.CommitTs, func(ctx context.Context, txn *badger.Txn) error {
-		return fsm.db.batchWriteWithTxn(ctx, txn, cmd.SubCommands)
 	})
 }
 
