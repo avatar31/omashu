@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"sync"
 	"time"
 
@@ -20,6 +21,11 @@ import (
 	"go.etcd.io/raft/v3/raftpb"
 	"go.uber.org/zap"
 )
+
+// TODO: P0: Handle transport.SendSnapshot
+// 1. Handle transport errors and implement retry logic
+// 2. Implement TLS support for secure communication between nodes
+// 3. Add metrics and logging for transport operations
 
 const (
 	defaultReqTimeout = 5 * time.Second
@@ -33,44 +39,43 @@ type Transport struct {
 	mu    sync.Mutex
 	peers map[uint64]string // nodeID -> address
 
-	httpstopc chan struct{}
-	log       *zap.Logger
+	log *zap.Logger
 }
 
 func NewTransport(id uint64, peers map[uint64]string, log *zap.Logger) *Transport {
 	return &Transport{
-		id:        id,
-		peers:     peers,
-		log:       log,
-		httpstopc: make(chan struct{}),
+		id:    id,
+		peers: peers,
+		log:   log,
 	}
 }
 
-func (tr *Transport) Start(ctx context.Context, cluster Cluster, node *Node, snapshotter *snap.Snapshotter, errorC chan error) {
+func (tr *Transport) Start(ctx context.Context, cfg *Config, node *Node, snapshotter *snap.Snapshotter) {
 	tr.raftTr = &rafthttp.Transport{
-		ID:          etcdtypes.ID(tr.id),
-		ClusterID:   etcdtypes.ID(cluster.GetClusterID()),
-		Raft:        node,
-		ErrorC:      errorC,
 		Logger:      tr.log, //TODO: P0: Fix me
-		ServerStats: stats.NewServerStats("", ""),
-		LeaderStats: stats.NewLeaderStats(tr.log, fmt.Sprintf("%d", tr.id)),
+		DialTimeout: cfg.PeerDialTimeout(),
+		ID:          etcdtypes.ID(tr.id),
+		ClusterID:   etcdtypes.ID(node.cluster.GetID()),
+		Raft:        node,
 		Snapshotter: snapshotter, // TODO: P0: Why do we need this?
+		ServerStats: stats.NewServerStats(node.cluster.GetName(), strconv.FormatUint(node.cluster.GetID(), 10)),
+		LeaderStats: stats.NewLeaderStats(tr.log, strconv.FormatUint(tr.id, 10)),
+		ErrorC:      node.errChan,
 	}
 
 	err := tr.raftTr.Start()
 	if err != nil {
-		errorC <- err
+		node.errChan <- err
 	}
 
 	addr, ok := tr.peers[tr.id]
 	if !ok {
-		errorC <- fmt.Errorf("no address found for node %d", tr.id)
+		node.errChan <- fmt.Errorf("no address found for node %d", tr.id)
 	}
 
 	parsedAddr, err := url.Parse(addr)
 	if err != nil {
-		errorC <- err
+		node.errChan <- err
 	}
 
 	for i := range tr.peers {
@@ -86,21 +91,12 @@ func (tr *Transport) Start(ctx context.Context, cluster Cluster, node *Node, sna
 		WriteTimeout: defaultReqTimeout,
 	}
 
-	localErrorC := make(chan error)
 	tr.log.Info("Serving raft in address", zap.String("address", addr))
-	go func(localErrorC chan error) {
+	go func() {
 		if err := tr.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			localErrorC <- err
+			node.errChan <- err
 		}
-	}(localErrorC)
-
-	select {
-	case err := <-localErrorC:
-		errorC <- err
-	case <-time.After(1 * time.Second):
-		// Assume server started successfully if no error after 1 second
-		tr.log.Info("Raft HTTP server started successfully")
-	}
+	}()
 }
 
 func (tr *Transport) Send(ctx context.Context, messages []raftpb.Message) {

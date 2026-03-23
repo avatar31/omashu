@@ -21,9 +21,8 @@ func (c *Command) Encode() ([]byte, error) {
 }
 
 func (c *Command) AddSubCommand(subCmd *Command) {
-	if subCmd == nil ||
-		subCmd.Type == CommandType_TRANSACTION ||
-		subCmd.Type == CommandType_DELETE_BY_PREFIX {
+	if subCmd == nil || subCmd.Type == CommandType_TRANSACTION {
+		panic("dev stage panic: invalid sub command")
 	}
 
 	c.SubCommands = append(c.SubCommands, subCmd)

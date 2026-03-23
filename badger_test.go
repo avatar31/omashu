@@ -38,23 +38,23 @@ func setupMockDB(managed bool) (*Badger, func()) {
 	}
 
 	var result map[string]any
-	json.Unmarshal(data, &result)
+	_ = json.Unmarshal(data, &result)
 
 	for key, value := range result {
 		switch v := value.(type) {
 		case map[string]any:
 			b, _ := json.Marshal(v)
-			mockDB.Set(ctx, key, b)
+			_ = mockDB.Set(ctx, key, b)
 		case float64:
 			b := utils.Uint64ToBytes(uint64(v))
-			mockDB.Set(ctx, key, b)
+			_ = mockDB.Set(ctx, key, b)
 		default:
 			fmt.Printf("Unhandled type %T\n", v)
 		}
 	}
 
 	return mockDB, func() {
-		mockDB.db.Close()
+		_ = mockDB.db.Close()
 	}
 }
 
@@ -76,7 +76,7 @@ var bulkGetTestcases = []bulkGetTC{
 		validateValue: func(t *testing.T, result map[string][]byte) {
 			assert.Equal(t, 3, len(result))
 			var user1 map[string]any
-			json.Unmarshal(result["users:1"], &user1)
+			_ = json.Unmarshal(result["users:1"], &user1)
 			assert.Equal(t, "Alice", user1["name"])
 		},
 	},
@@ -531,7 +531,7 @@ func TestDeleteByPrefixWithTxn(t *testing.T) {
 	for _, tc := range tcList {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.db.NewTransaction(ctx, func(ctx context.Context, txn *badger.Txn) error {
-				tc.db.DeleteByPrefixWithTxn(ctx, txn, tc.prefix)
+				_ = tc.db.DeleteByPrefixWithTxn(ctx, txn, tc.prefix)
 				return nil
 			})
 
@@ -758,7 +758,7 @@ var getByPrefixTestcases = []getByPrefix{
 		validateValue: func(t *testing.T, result map[string][]byte) {
 			assert.Equal(t, 3, len(result))
 			var user1 map[string]any
-			json.Unmarshal(result["users:1"], &user1)
+			_ = json.Unmarshal(result["users:1"], &user1)
 			assert.Equal(t, "Alice", user1["name"])
 		},
 	},
@@ -779,7 +779,7 @@ var getByPrefixTestcases = []getByPrefix{
 		validateValue: func(t *testing.T, result map[string][]byte) {
 			assert.Equal(t, 2, len(result))
 			var order map[string]any
-			json.Unmarshal(result["user:1:orders:1"], &order)
+			_ = json.Unmarshal(result["user:1:orders:1"], &order)
 			assert.Equal(t, float64(1), order["id"])
 		},
 	},
@@ -1109,7 +1109,7 @@ func TestIterateByPrefix(t *testing.T) {
 			processed := 0
 			cursor, err := ts.db.IterateByPrefix(ctx, "products:", "", nil, func(k, v []byte) bool {
 				var product map[string]any
-				json.Unmarshal(v, &product)
+				_ = json.Unmarshal(v, &product)
 
 				// Filter: only process products that are in stock
 				if !product["inStock"].(bool) {
@@ -1246,7 +1246,7 @@ var setTestcases = []setTC{
 			assert.NoError(t, err)
 			assert.True(t, exist)
 			var user map[string]any
-			json.Unmarshal(value, &user)
+			_ = json.Unmarshal(value, &user)
 			assert.Equal(t, float64(4), user["id"])
 			assert.Equal(t, "Dave", user["name"])
 		},
@@ -1261,7 +1261,7 @@ var setTestcases = []setTC{
 			assert.NoError(t, err)
 			assert.True(t, exist)
 			var user map[string]any
-			json.Unmarshal(value, &user)
+			_ = json.Unmarshal(value, &user)
 			assert.Equal(t, "Alice Updated", user["name"])
 		},
 	},
@@ -1399,7 +1399,7 @@ var updateJsonTestcases = []updateJsonTC{
 			assert.True(t, exist)
 
 			var user map[string]any
-			json.Unmarshal(value, &user)
+			_ = json.Unmarshal(value, &user)
 			assert.Equal(t, float64(1), user["id"])
 			assert.Equal(t, "Alice", user["name"])
 			assert.Equal(t, float64(30), user["age"])
@@ -1417,7 +1417,7 @@ var updateJsonTestcases = []updateJsonTC{
 			assert.True(t, exist)
 
 			var user map[string]any
-			json.Unmarshal(value, &user)
+			_ = json.Unmarshal(value, &user)
 			assert.Equal(t, float64(2), user["id"])
 			assert.Equal(t, "Robert", user["name"])
 			assert.Equal(t, float64(26), user["age"])
@@ -1435,7 +1435,7 @@ var updateJsonTestcases = []updateJsonTC{
 			assert.True(t, exist)
 
 			var user map[string]any
-			json.Unmarshal(value, &user)
+			_ = json.Unmarshal(value, &user)
 			assert.Equal(t, float64(999), user["id"])
 			assert.Equal(t, "NewUser", user["name"])
 		},
@@ -1452,7 +1452,7 @@ var updateJsonTestcases = []updateJsonTC{
 			assert.True(t, exist)
 
 			var user map[string]any
-			json.Unmarshal(value, &user)
+			_ = json.Unmarshal(value, &user)
 			assert.Equal(t, float64(3), user["id"])
 			assert.Equal(t, "Charlie", user["name"])
 		},
@@ -1469,7 +1469,7 @@ var updateJsonTestcases = []updateJsonTC{
 			assert.True(t, exist)
 
 			var user map[string]any
-			json.Unmarshal(value, &user)
+			_ = json.Unmarshal(value, &user)
 			assert.Equal(t, float64(4), user["id"])
 			assert.Equal(t, "Dave", user["name"])
 			address := user["address"].(map[string]any)

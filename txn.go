@@ -72,6 +72,8 @@ type Txn struct {
 }
 
 func (txn *Txn) addReadKey(key string) {
+	txn.readsLock.Lock()
+	defer txn.readsLock.Unlock()
 	txn.reads = append(txn.reads, key)
 }
 

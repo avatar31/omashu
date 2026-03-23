@@ -77,9 +77,12 @@ func (bdb *Badger) Count(ctx context.Context, prefix string) int {
 		return nil
 	}
 
-	bdb.db.View(func(txn *badger.Txn) error {
+	err := bdb.db.View(func(txn *badger.Txn) error {
 		return iterate(txn)
 	})
+	if err != nil {
+		return 0
+	}
 
 	return count
 }
@@ -103,7 +106,7 @@ func (bdb *Badger) Exists(ctx context.Context, key string) bool {
 func (bdb *Badger) HasChild(ctx context.Context, prefix string) bool {
 	prefixBytes := []byte(prefix)
 	has := false
-	bdb.db.View(func(txn *badger.Txn) error {
+	err := bdb.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false // We're only interested in keys
 		it := txn.NewIterator(opts)
@@ -114,6 +117,10 @@ func (bdb *Badger) HasChild(ctx context.Context, prefix string) bool {
 		}
 		return nil
 	})
+	if err != nil {
+		return false
+	}
+
 	return has
 }
 
@@ -198,7 +205,7 @@ func (bdb *Badger) GetByPrefixWithTxn(ctx context.Context, txn *badger.Txn,
 func (bdb *Badger) GetKeysByPrefix(ctx context.Context, prefix string) ([]string, error) {
 	keys := []string{}
 	var err error
-	bdb.db.View(func(txn *badger.Txn) error {
+	err = bdb.db.View(func(txn *badger.Txn) error {
 		keys, err = bdb.GetKeysByPrefixWithTxn(ctx, txn, prefix)
 		return err
 	})
@@ -497,8 +504,7 @@ func (bdb *Badger) DeleteByPrefix(ctx context.Context, prefix string) error {
 	}
 
 	err := bdb.db.Update(func(txn *badger.Txn) error {
-		bdb.DeleteByPrefixWithTxn(ctx, txn, prefix)
-		return nil
+		return bdb.DeleteByPrefixWithTxn(ctx, txn, prefix)
 	})
 	if err != nil {
 		bdb.log.Error("Error while deleting data in database", zap.String("prefix", prefix), zap.Error(err))
@@ -567,7 +573,7 @@ func (bdb *Badger) getKeysByPrefixAt(ctx context.Context, prefix string, readTs 
 	keys := []string{}
 	var err error
 
-	bdb.newReadOnlyTransactionAt(ctx, readTs, func(ctx context.Context, txn *badger.Txn) error {
+	err = bdb.newReadOnlyTransactionAt(ctx, readTs, func(ctx context.Context, txn *badger.Txn) error {
 		keys, err = bdb.GetKeysByPrefixWithTxn(ctx, txn, prefix)
 		return err
 	})
@@ -666,35 +672,6 @@ func (bdb *Badger) runVlogGC(ctx context.Context) {
 	ticker := time.NewTicker(bdb.gcInterval)
 	defer ticker.Stop()
 
-	var lastSz int64
-	for {
-		select {
-		case <-ctx.Done():
-			bdb.log.Info("Stopping Badger value log GC routine")
-			return
-		case <-ticker.C:
-			bdb.runGC(&lastSz)
-		}
-	}
-}
-
-func (bdb *Badger) runGC(lastSz *int64) {
-	bdb.log.Info("Running Badger value log GC")
-	if bdb.managed {
-		if bdb.oracle == nil {
-			bdb.log.Warn("Oracle is not set for managed Badger DB. Skipping running GC.")
-			return
-		}
-		discardTs := bdb.oracle.DiscardAt()
-		bdb.db.SetDiscardTs(discardTs)
-		bdb.log.Info("Setting discardTs", zap.Uint64("discardTs", discardTs))
-	}
-
-	for err := error(nil); err == nil; {
-		// If a GC is successful, immediately run it again.
-		err = bdb.db.RunValueLogGC(bdb.gcDiscardRatio)
-	}
-
 	abs := func(a, b int64) int64 {
 		if a > b {
 			return a - b
@@ -702,11 +679,40 @@ func (bdb *Badger) runGC(lastSz *int64) {
 		return b - a
 	}
 
-	_, sz := bdb.db.Size()
-	if abs(*lastSz, sz) > 512<<20 {
-		bdb.log.Info("Value log size", zap.String("size", humanize.Bytes(uint64(sz))),
-			zap.String("lastSize", humanize.Bytes(uint64(*lastSz))))
-		lastSz = &sz
+	var lastSz int64
+	runGC := func() {
+		bdb.log.Info("Running Badger value log GC")
+		if bdb.managed {
+			if bdb.oracle == nil {
+				bdb.log.Warn("Oracle is not set for managed Badger DB. Skipping running GC.")
+				return
+			}
+			discardTs := bdb.oracle.DiscardAt()
+			bdb.db.SetDiscardTs(discardTs)
+			bdb.log.Info("Setting discardTs", zap.Uint64("discardTs", discardTs))
+		}
+
+		for err := error(nil); err == nil; {
+			// If a GC is successful, immediately run it again.
+			err = bdb.db.RunValueLogGC(bdb.gcDiscardRatio)
+		}
+
+		_, sz := bdb.db.Size()
+		if abs(lastSz, sz) > 512<<20 {
+			bdb.log.Info("Value log size", zap.String("size", humanize.Bytes(uint64(sz))),
+				zap.String("lastSize", humanize.Bytes(uint64(lastSz))))
+			lastSz = sz
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			bdb.log.Info("Stopping Badger value log GC routine")
+			return
+		case <-ticker.C:
+			runGC()
+		}
 	}
 }
 

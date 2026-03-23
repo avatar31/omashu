@@ -125,7 +125,9 @@ func MergeProtoDelta(stored []byte, delta proto.Message) ([]byte, error) {
 	}
 
 	// Merge delta
-	MergeProtobufMessages(base, delta)
+	if err := MergeProtobufMessages(base, delta); err != nil {
+		return nil, err
+	}
 
 	// Save back
 	return proto.Marshal(base)

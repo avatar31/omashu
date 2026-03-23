@@ -25,7 +25,8 @@ var (
 )
 
 type Cluster interface {
-	GetClusterID() uint64
+	GetID() uint64
+	GetName() string
 	IsNodeRemoved(id uint64) bool
 }
 
@@ -97,5 +98,17 @@ func (cfg *Config) validate(distributed bool) error {
 		cfg.BadgerOptions = cfg.BadgerOptions.WithLogger(newLogger(fmt.Sprintf("%s.badger", cfg.Name), cfg.Logger))
 	}
 
+	if cfg.BadgerOptions.InMemory {
+		cfg.BaseDir = ""
+	}
 	return nil
+}
+
+func (c *Config) PeerDialTimeout() time.Duration {
+	if c.RaftConfig == nil {
+		c.Logger.Panic("RaftConfig is required for distributed mode")
+	}
+
+	// 1s for queue wait and election timeout
+	return time.Second + time.Duration(c.RaftConfig.ElectionTick*int(c.RaftConfig.HeartbeatTick))*time.Millisecond
 }
