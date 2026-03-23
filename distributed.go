@@ -239,10 +239,6 @@ func (s *DistributedBadger) listenProposeResponses(ctx context.Context) {
 }
 
 func (s *DistributedBadger) waitForReadState(ctx context.Context, key string) error {
-	if !s.isLeader() {
-		return nil
-	}
-
 	var appliedIndex, rsIndex uint64
 	start := time.Now()
 	defer func() {

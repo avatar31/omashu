@@ -58,6 +58,7 @@ type Node struct {
 	confChangeNotifier chan raftpb.ConfChange
 	proposeNotifier    chan []byte
 	stopNotifier       chan struct{}
+	errChan            chan error
 	readStatesNotifier chan raft.ReadState
 	respNotifier       chan ProposeResp
 
@@ -65,7 +66,6 @@ type Node struct {
 	onLeaderChange func(ctx context.Context, prevLeader, newLeader uint64)
 	onRemovedSelf  func()
 
-	mu  sync.RWMutex
 	log *zap.Logger
 }
 
@@ -80,6 +80,7 @@ func newNode(id uint64, nodename string, peers map[uint64]string, fsm *FSM, log 
 		stopNotifier:       make(chan struct{}),
 		readStatesNotifier: make(chan raft.ReadState, 2),
 		respNotifier:       make(chan ProposeResp, 1),
+		errChan:            make(chan error),
 		log:                log,
 	}
 
@@ -131,22 +132,12 @@ func (node *Node) Start(ctx context.Context, cfg *Config) error {
 		node.n = raft.StartNode(raftConf, peers)
 	}
 
-	errCh := make(chan error)
 	node.transport = NewTransport(node.id, node.peers, node.log)
-	node.transport.Start(ctx, node.cluster, node, storage.wal.snapshotter, errCh)
+	node.transport.Start(ctx, cfg, node, storage.wal.snapshotter)
 
 	go node.run(ctx)
 
-	select {
-	case err := <-errCh:
-		node.log.Error("Failed to start transport. Stopping raft node.", zap.Error(err))
-		node.Stop(ctx)
-		return err
-	case <-time.After(5 * time.Second):
-		// Assuming transport started successfully
-	}
-
-	node.log.Info("Raft node started successfully")
+	node.log.Info("Raft node initiated")
 	return nil
 }
 
@@ -176,6 +167,9 @@ func (node *Node) run(ctx context.Context) {
 		select {
 		case <-ticker.C:
 			node.n.Tick()
+		case err := <-node.errChan:
+			node.log.Error("Received error from node", zap.Error(err))
+			return
 		case prop := <-node.proposeNotifier:
 			c, _ := types.DecodeCommand(prop)
 			if node.getSelfRemoved() {
@@ -231,7 +225,7 @@ func (node *Node) processReady(ctx context.Context, rd *raft.Ready) error {
 	// node.setTerm(rd.Term)
 	if rd.SoftState != nil {
 		node.log.Info("Soft state changed", zap.String("softState", raft.DescribeSoftState(*rd.SoftState)))
-		node.handleLeaderChange(ctx, rd.SoftState.Lead)
+		node.handleLeaderChange(ctx, rd.Lead)
 	}
 
 	pendingReadStates := make([]raft.ReadState, 0)
@@ -397,15 +391,6 @@ func (node *Node) getEntriesToApply(committedEntries []raftpb.Entry) []raftpb.En
 
 	appliedIndex := node.getAppliedIndex()
 	firstIndex := committedEntries[0].Index
-	for range RetryCount {
-		if firstIndex > appliedIndex+1 {
-			node.log.Warn(fmt.Sprintf("First index of committed entries (%d) is greater than applied index + 1 (%d). Retrying...",
-				firstIndex, appliedIndex+1))
-			time.Sleep(100 * time.Millisecond)
-			appliedIndex = node.getAppliedIndex()
-		}
-	}
-
 	if firstIndex > appliedIndex+1 {
 		node.log.Panic(fmt.Sprintf("First index of committed entries (%d) is greater than applied index + 1 (%d)",
 			firstIndex, appliedIndex+1))
@@ -494,18 +479,20 @@ func (node *Node) applyConfChange(ctx context.Context, entry raftpb.Entry) (bool
 	return false, nil
 }
 
-
 // Leader                                    Follower
 // ──────                                    ────────
 // takeSnapshotIfNeeded()                    receives MsgSnap
-//   FSM.CreateSnapshot()          ──────>   processReady()
-//   storage.CreateSnapshot()                  storage.SaveState()  (saves incoming snap)
-//     wal.SaveSnap()                           transport.Send()
-//     memStorage.Compact()                     FSM.RestoreSnapshot()
-//                                              n.Advance()
+//
+//	FSM.CreateSnapshot()          ──────>   processReady()
+//	storage.CreateSnapshot()                  storage.SaveState()  (saves incoming snap)
+//	  wal.SaveSnap()                           transport.Send()
+//	  memStorage.Compact()                     FSM.RestoreSnapshot()
+//	                                           n.Advance()
+//
 // processReady()
-//   getMessagesToPublish()        ──────>   injects current confState into MsgSnap
-//   transport.Send(MsgSnap)
+//
+//	getMessagesToPublish()        ──────>   injects current confState into MsgSnap
+//	transport.Send(MsgSnap)
 func (node *Node) takeSnapshotIfNeeded(ctx context.Context, force bool) {
 	confState := node.getConfState()
 	snapshotIndex := node.storage.LastSnapshotIndex()

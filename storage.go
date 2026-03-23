@@ -45,6 +45,7 @@ func (s *Storage) Initialize(ctx context.Context) error {
 		err = s.memStorage.ApplySnapshot(*latestSnap)
 		if err != nil {
 			s.log.Error("Error applying snapshot to memory storage", zap.Error(err))
+			/* trunk-ignore(golangci-lint2/errcheck) */
 			s.wal.Close()
 			return err
 		}
@@ -58,6 +59,7 @@ func (s *Storage) Initialize(ctx context.Context) error {
 		err = s.memStorage.SetHardState(*hardState)
 		if err != nil {
 			s.log.Error("Error setting hard state to memory storage", zap.Error(err))
+			/* trunk-ignore(golangci-lint2/errcheck) */
 			s.wal.Close()
 			return err
 		}
@@ -69,6 +71,7 @@ func (s *Storage) Initialize(ctx context.Context) error {
 		err = s.memStorage.Append(entries)
 		if err != nil {
 			s.log.Error("Error appending entries to memory storage", zap.Error(err))
+			/* trunk-ignore(golangci-lint2/errcheck) */
 			s.wal.Close()
 			return err
 		}
@@ -190,6 +193,14 @@ func (s *Storage) CreateSnapshot(index uint64, confState raftpb.ConfState, data 
 	// causing it to loop forever asking for entries that no longer exist.
 	if err := s.memStorage.ApplySnapshot(snapshot); err != nil && err != raft.ErrSnapOutOfDate {
 		return fmt.Errorf("failed to apply snapshot to memory storage: %w", err)
+	}
+
+	// Force WAL to fsync its hard state before Release() releases
+	// old data from the WAL. Otherwise could get an error like:
+	// Was the raft log corrupted, truncated, or lost?
+	// See https://github.com/etcd-io/etcd/issues/10219 for more details.
+	if err := s.wal.Sync(); err != nil {
+		return err
 	}
 
 	if err := s.wal.Release(snapshot.Metadata.Index); err != nil {

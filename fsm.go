@@ -117,8 +117,7 @@ func (fsm *FSM) applyDelete(ctx context.Context, cmd *types.Command) error {
 
 func (fsm *FSM) applyDeleteByPrefix(ctx context.Context, cmd *types.Command) error {
 	return fsm.db.newTransactionAt(ctx, cmd.ReadTs, cmd.CommitTs, func(ctx context.Context, txn *badger.Txn) error {
-		fsm.db.DeleteByPrefixWithTxn(ctx, txn, cmd.Prefix)
-		return nil
+		return fsm.db.DeleteByPrefixWithTxn(ctx, txn, cmd.Prefix)
 	})
 }
 

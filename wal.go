@@ -123,6 +123,7 @@ func (w *Wal) openWAL(snapshot *raftpb.Snapshot) (*wal.WAL, error) {
 			return nil, err
 		}
 		w.log.Info("Created new WAL")
+		/* trunk-ignore(golangci-lint2/errcheck) */
 		walInt.Close()
 	}
 
