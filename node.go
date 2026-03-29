@@ -16,8 +16,6 @@ import (
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 	"go.uber.org/zap"
-
-	"github.com/avatar31/omashu/types"
 )
 
 const (
@@ -30,9 +28,10 @@ const (
 // server/etcdserver/raft.go
 // server/etcdserver/bootstrap.go
 
-type ProposeResp struct {
-	CmdID string
-	Err   error
+type propose struct {
+	cmdID   string
+	cmd     []byte
+	ErrResp error
 }
 
 type Node struct {
@@ -55,12 +54,12 @@ type Node struct {
 	// committedIndex atomic.Uint64
 	// term           atomic.Uint64
 
-	confChangeNotifier chan raftpb.ConfChange
-	proposeNotifier    chan []byte
-	stopNotifier       chan struct{}
-	errChan            chan error
-	readStatesNotifier chan raft.ReadState
-	respNotifier       chan ProposeResp
+	confChangeNotifier  chan raftpb.ConfChange
+	proposeReqNotifier  chan propose
+	proposeRespNotifier chan propose
+	stopNotifier        chan struct{}
+	errChan             chan error
+	readStatesNotifier  chan raft.ReadState
 
 	// callbacks
 	onLeaderChange func(ctx context.Context, prevLeader, newLeader uint64)
@@ -71,17 +70,17 @@ type Node struct {
 
 func newNode(id uint64, nodename string, peers map[uint64]string, fsm *FSM, log *zap.Logger) (*Node, error) {
 	node := &Node{
-		id:                 id,
-		name:               nodename,
-		peers:              peers,
-		fsm:                fsm,
-		confChangeNotifier: make(chan raftpb.ConfChange),
-		proposeNotifier:    make(chan []byte, 1),
-		stopNotifier:       make(chan struct{}),
-		readStatesNotifier: make(chan raft.ReadState, 2),
-		respNotifier:       make(chan ProposeResp, 1),
-		errChan:            make(chan error),
-		log:                log,
+		id:                  id,
+		name:                nodename,
+		peers:               peers,
+		fsm:                 fsm,
+		confChangeNotifier:  make(chan raftpb.ConfChange),
+		proposeReqNotifier:  make(chan propose, 1),
+		proposeRespNotifier: make(chan propose, 1),
+		stopNotifier:        make(chan struct{}),
+		readStatesNotifier:  make(chan raft.ReadState, 2),
+		errChan:             make(chan error),
+		log:                 log,
 	}
 
 	return node, nil
@@ -135,16 +134,16 @@ func (node *Node) Start(ctx context.Context, cfg *Config) error {
 	node.transport = NewTransport(node.id, node.peers, node.log)
 	node.transport.Start(ctx, cfg, node, storage.wal.snapshotter)
 
-	go node.run(ctx)
+	go node.readyHandler(ctx)
+	go node.proposeHandler(ctx)
 
 	node.log.Info("Raft node initiated")
 	return nil
 }
 
-func (node *Node) run(ctx context.Context) {
+func (node *Node) readyHandler(ctx context.Context) {
 	defer node.Stop(ctx)
 
-	// go func() {
 	snap, err := node.storage.Snapshot()
 	if err != nil {
 		node.log.Error("Failed to get snapshot from storage", zap.Error(err))
@@ -170,19 +169,45 @@ func (node *Node) run(ctx context.Context) {
 		case err := <-node.errChan:
 			node.log.Error("Received error from node", zap.Error(err))
 			return
-		case prop := <-node.proposeNotifier:
-			c, _ := types.DecodeCommand(prop)
+		case rd := <-node.n.Ready():
 			if node.getSelfRemoved() {
 				node.log.Warn("Node has been removed from cluster. Not processing any new requests.")
-				node.respNotifier <- ProposeResp{CmdID: c.Id, Err: errors.New("node has been removed from cluster")}
 				continue
 			}
 
-			err := node.n.Propose(ctx, prop)
-			if err != nil {
-				node.log.Error("Failed to propose entry", zap.Error(err), zap.String("cmdID", c.Id))
+			if err := node.processReady(ctx, &rd); err != nil {
+				node.log.Error("Failed to process ready. Stopping raft Ready handler.", zap.Error(err))
+				return
 			}
-			node.respNotifier <- ProposeResp{CmdID: c.Id, Err: err}
+		case <-ctx.Done():
+			node.log.Info("Context cancelled. Stopping raft Ready handler.")
+			return
+		case <-node.stopNotifier:
+			node.log.Info("Stop notification received. Stopping raft Ready handler.")
+			return
+		}
+	}
+}
+
+func (node *Node) proposeHandler(ctx context.Context) {
+	for {
+		select {
+		case prop := <-node.proposeReqNotifier:
+			if node.getSelfRemoved() {
+				node.log.Warn("Node has been removed from cluster. Not processing any new requests.")
+				node.proposeRespNotifier <- propose{cmdID: prop.cmdID, ErrResp: errors.New("node has been removed from cluster")}
+				continue
+			}
+
+			node.log.Info("Received proposal to propose to raft", zap.Uint64("lead", node.getLead()), zap.String("cmdID", prop.cmdID))
+			err := node.n.Propose(ctx, prop.cmd)
+			if err != nil {
+				node.log.Error("Failed to propose entry", zap.Error(err), zap.String("cmdID", prop.cmdID))
+				node.errChan <- err
+				return
+			}
+			node.log.Info("Proposal sent to raft", zap.String("cmdID", prop.cmdID))
+			node.proposeRespNotifier <- propose{cmdID: prop.cmdID, ErrResp: err}
 		case cc := <-node.confChangeNotifier:
 			if node.getSelfRemoved() {
 				node.log.Warn("Node has been removed from cluster. Not processing any new requests.")
@@ -191,24 +216,15 @@ func (node *Node) run(ctx context.Context) {
 
 			err := node.n.ProposeConfChange(ctx, cc)
 			if err != nil {
-				node.log.Error("Failed to propose conf change. Stopping raft node.", zap.Error(err))
-				return
-			}
-		case rd := <-node.n.Ready():
-			if node.getSelfRemoved() {
-				node.log.Warn("Node has been removed from cluster. Not processing any new requests.")
-				continue
-			}
-
-			if err := node.processReady(ctx, &rd); err != nil {
-				node.log.Error("Failed to process ready. Stopping raft node.", zap.Error(err))
+				node.log.Error("Failed to propose conf change. Stopping raft Propose handler.", zap.Error(err))
+				node.errChan <- err
 				return
 			}
 		case <-ctx.Done():
-			node.log.Info("Context cancelled. Stopping raft node.")
+			node.log.Info("Context cancelled. Stopping raft Propose handler.")
 			return
 		case <-node.stopNotifier:
-			node.log.Info("Stop notification received. Stopping raft node.")
+			node.log.Info("Stop notification received. Stopping raft Propose handler.")
 			return
 		}
 	}
@@ -552,12 +568,12 @@ func (node *Node) WaitForReadState(ctx context.Context, timeout time.Duration) (
 	}
 }
 
-func (node *Node) ProposeNotifier() chan<- []byte {
-	return node.proposeNotifier
+func (node *Node) ProposeReqNotifier() chan<- propose {
+	return node.proposeReqNotifier
 }
 
-func (node *Node) ProposeRespNotifier() <-chan ProposeResp {
-	return node.respNotifier
+func (node *Node) ProposeRespNotifier() <-chan propose {
+	return node.proposeRespNotifier
 }
 
 func (node *Node) setAppliedIndex(v uint64) {

@@ -34,52 +34,27 @@ import (
 // - Add support for dynamic cluster membership changes (adding/removing nodes)
 // - Implement monitoring and alerting for Raft node health and performance
 // - Optimize read operations to reduce latency on follower nodes
-// - Add support for multi-region deployments and cross-region replication
 // - Implement backup and restore functionality for the DBStore
 // - Add documentation and usage examples for DBStore API
 // - Implement security features like encryption and authentication for Raft communication
 // - Optimize transaction management for high concurrency scenarios
-// - Add support for different storage backends (e.g., in-memory, distributed storage)
 // - Implement advanced conflict resolution strategies for transactions
 // - Add support for complex queries and indexing in the DBStore
 // - Implement performance benchmarking and optimization for DBStore operations
-// - Add support for schema migrations and versioning in the DBStore
 // - Implement a web-based dashboard for monitoring and managing the DBStore and Raft cluster
 // - Add support for custom command types and extensibility in the DBStore API
 // - Implement load balancing and failover strategies for Raft nodes
-// - Add support for event-driven architecture and notifications for DBStore changes
 // - Implement advanced logging and tracing for debugging and performance analysis
-// - Add support for distributed transactions across multiple DBStore instances
-// - Implement a plugin system for extending DBStore functionality
 // - Add support for real-time data streaming and change data capture from the DBStore
 // - Implement advanced data consistency models (e.g., eventual consistency, strong consistency)
 // - Add support for data sharding and partitioning in the DBStore
 // - Implement a comprehensive testing framework for DBStore and Raft interactions
-// - Add support for integration with external systems and services (e.g., message queues, caches)
 // - Implement advanced data analytics and reporting features for the DBStore
-// - Add support for user-defined functions and stored procedures in the DBStore
 // - Implement a command-line interface (CLI) for managing and interacting with the DBStore
 // - Add support for data versioning and auditing in the DBStore
-// - Implement advanced security features like role-based access control (RBAC) for the DBStore
-// - Add support for multi-tenant deployments of the DBStore
-// - Implement advanced data compression and optimization techniques for the DBStore
-// - Add support for real-time collaboration and concurrent editing in the DBStore
 // - Implement a comprehensive documentation portal for the DBStore and its features
-// - Add support for community contributions and open-source collaboration on the DBStore project
 // - Implement advanced data visualization and exploration tools for the DBStore
-// - Add support for machine learning and AI integration with the DBStore
-// - Implement a roadmap and feature planning process for the DBStore project
-// - Add support for continuous integration and deployment (CI/CD) for the DBStore project
 // - Implement advanced data governance and compliance features for the DBStore
-// - Add support for internationalization and localization in the DBStore
-// - Implement a user feedback and feature request system for the DBStore project
-// - Add support for community forums and discussion boards for the DBStore project
-// - Implement advanced data lifecycle management and retention policies for the DBStore
-// - Add support for third-party integrations and plugins for the DBStore
-// - Implement a comprehensive security audit and vulnerability assessment for the DBStore
-// - Add support for advanced data replication and synchronization strategies for the DBStore
-// - Implement a community-driven roadmap and feature prioritization process for the DBStore project
-// - Add support for advanced data recovery and disaster recovery strategies for the DBStore
 
 const (
 	DefaultProposeTimeout = 5 * time.Second
@@ -92,16 +67,22 @@ const (
 
 func initDistributed(ctx context.Context, db *Badger, cfg *Config) (*DistributedBadger, error) {
 	instance := &DistributedBadger{
-		log:                cfg.Logger,
+		log:                cfg.Logger.With(zap.Uint64("nodeId", cfg.RaftConfig.ID)),
 		onLeaderChangeHook: cfg.OnLeaderChange,
 		onRemovedSelfHook:  cfg.OnRemovedSelf,
 	}
 
+	// At this point, the TSO and TxnManager are initialized but not serving.
+	// They will start serving when this node becomes the leader.
+	// It's DistributedBadger responsibility to request for readtTs and commitTs only on leader node
+	instance.tso = newTSO(instance, instance.log)
+	instance.tm = newTxnManager(instance, instance.tso, instance.log)
 	fsm, err := newFSM(db, instance.log)
 	if err != nil {
 		return nil, err
 	}
 	instance.fsm = fsm
+	instance.fsm.db.setOracle(instance.tso)
 
 	// Init Raft Node
 	node, err := newNode(cfg.RaftConfig.ID, cfg.RaftConfig.Nodename, cfg.RaftConfig.Peers, instance.fsm, instance.log)
@@ -120,64 +101,38 @@ func initDistributed(ctx context.Context, db *Badger, cfg *Config) (*Distributed
 	instance.node.WithLeaderChangeHook(instance.onLeaderChange)
 	instance.node.WithRemovedSelfHook(instance.onRemovedSelf)
 
-	if instance.isLeader() {
-		instance.log.Info("Initializing TSO and TxnManager in Raft Leader node")
-
-		tso, err := newTSO(ctx, instance, instance.log)
-		if err != nil {
-			instance.Close(ctx)
-			return nil, err
-		}
-
-		instance.mu.Lock()
-		instance.tso = tso
-		instance.fsm.db.setOracle(tso)
-		instance.tm = newTxnManager(instance, tso, instance.log)
-		instance.leaderChangeNotifier = make(chan struct{})
-		instance.mu.Unlock()
-
-		go instance.listenProposeResponses(ctx)
-	}
-
 	return instance, nil
 }
 
 func (s *DistributedBadger) onLeaderChange(ctx context.Context, prevLeader, newLeader uint64) {
 	if newLeader == s.node.id {
-		s.log.Info("This node is now the leader, initializing TSO and TxnManager")
-		tso, err := newTSO(ctx, s, s.log)
-		if err != nil {
-			s.Close(ctx)
-			s.log.Panic("Failed to initialize TSO on leadership gain", zap.Error(err))
-		}
+		s.log.Info("This node is now the leader, starting TSO server")
 
 		// Hold the write-lock for the shortest possible window: just the pointer
-		// swaps. TSO construction (newTSO) reads from Badger and can be slow,
+		// swaps. TSO construction (StartServing) reads from Badger and can be slow,
 		// so it must happen before acquiring the lock.
-		s.mu.Lock()
-		s.tso = tso
-		s.tm = newTxnManager(s, tso, s.log)
+		s.muLCNotifier.Lock()
 		s.leaderChangeNotifier = make(chan struct{})
-		s.mu.Unlock()
+		s.muLCNotifier.Unlock()
 
 		go s.listenProposeResponses(ctx)
+
+		err := s.tso.StartServing(ctx)
+		if err != nil {
+			s.Close(ctx)
+			s.log.Panic("Failed to start TSO server on leadership gain", zap.Error(err))
+		}
 	}
 
 	if prevLeader == s.node.id {
 		s.log.Info("This node is no longer the leader, stopping TSO and TxnManager")
 
-		s.mu.Lock()
-		prevTSO := s.tso
-		s.tso = nil
-		s.tm = nil
+		s.muLCNotifier.Lock()
 		notifier := s.leaderChangeNotifier
 		s.leaderChangeNotifier = nil
-		s.mu.Unlock()
+		s.muLCNotifier.Unlock()
 
-		if prevTSO != nil {
-			prevTSO.Close()
-		}
-
+		s.tso.Close()
 		if notifier != nil {
 			close(notifier)
 		}
@@ -194,38 +149,28 @@ func (s *DistributedBadger) onRemovedSelf() {
 	}
 }
 
-// getTM safely returns the active TxnManager under a read-lock.
-// Any leader-only operation must call this instead of accessing s.tm directly,
-// because onLeaderChange (running in node.run() goroutine) can nil s.tm at any time.
-func (s *DistributedBadger) getTM() (*TxnManager, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.tm == nil {
-		return nil, ErrNotLeader
-	}
-	return s.tm, nil
-}
-
 func (s *DistributedBadger) listenProposeResponses(ctx context.Context) {
 	// Capture the notifier channel for THIS leadership term under a read-lock.
 	// onLeaderChange replaces s.leaderChangeNotifier with a fresh channel each
 	// time leadership is gained. If we read s.leaderChangeNotifier directly
 	// inside the select without a captured reference, reading the field from
 	// two goroutines (this one and onLeaderChange's writer) is a data race.
-	s.mu.RLock()
+	s.muLCNotifier.RLock()
 	notifier := s.leaderChangeNotifier
-	s.mu.RUnlock()
+	s.muLCNotifier.RUnlock()
 
+	s.log.Info("Started listening for ProposeResponses")
 	for {
 		select {
 		case r := <-s.node.ProposeRespNotifier():
-			if ch, ok := s.proposals.Load(r.CmdID); ok {
+			s.log.Debug("Received propose response", zap.String("cmdID", r.cmdID), zap.Error(r.ErrResp))
+			if ch, ok := s.proposals.Load(r.cmdID); ok {
 				errCh, _ := ch.(chan error)
-				errCh <- r.Err
+				errCh <- r.ErrResp
 			} else {
-				s.log.Warn("No proposal channel found for response", zap.String("cmdID", r.CmdID))
-				if r.Err != nil {
-					s.log.Error("Proposal failed with error", zap.String("cmdID", r.CmdID), zap.Error(r.Err))
+				s.log.Warn("No proposal channel found for response", zap.String("cmdID", r.cmdID))
+				if r.ErrResp != nil {
+					s.log.Error("Proposal failed with error", zap.String("cmdID", r.cmdID), zap.Error(r.ErrResp))
 				}
 			}
 		case <-notifier:
@@ -288,8 +233,14 @@ func (s *DistributedBadger) HasChild(ctx context.Context, prefix string) bool {
 }
 
 func (s *DistributedBadger) Get(ctx context.Context, key string) ([]byte, bool, error) {
-	if err := s.waitForReadState(ctx, key); err != nil {
-		return nil, false, err
+	return s.getVal(ctx, key, false)
+}
+
+func (s *DistributedBadger) getVal(ctx context.Context, key string, skipLinearizable bool) ([]byte, bool, error) {
+	if !skipLinearizable {
+		if err := s.waitForReadState(ctx, key); err != nil {
+			return nil, false, err
+		}
 	}
 	return s.fsm.db.Get(ctx, key)
 }
@@ -468,16 +419,14 @@ func (s *DistributedBadger) NewTransaction(ctx context.Context, performOps func(
 		return ErrNotLeader
 	}
 
-	tm, err := s.getTM()
-	if err != nil {
-		return err
-	}
-	txn, err := tm.BeginTxn(ctx, true)
+	txn, err := s.tm.BeginTxn(ctx, true)
 	if err != nil {
 		s.log.Error("Failed to begin transaction", zap.Error(err))
 		return err
 	}
 	defer txn.Discard()
+
+	s.log.Debug("Starting new transaction", zap.Uint64("readTs", txn.readTs), zap.String("txnId", txn.id))
 
 	err = performOps(ctx, txn)
 	if err != nil {
@@ -491,6 +440,8 @@ func (s *DistributedBadger) NewTransaction(ctx context.Context, performOps func(
 		return err
 	}
 
+	s.log.Info("Proposing transaction with subcommands", zap.String("txnId", txn.id), zap.String("cmdId", cmd.Id),
+		zap.Int("subCommandsCount", len(cmd.SubCommands)))
 	return s.proposeAndWait(cmd)
 }
 
@@ -511,14 +462,7 @@ func (s *DistributedBadger) Close(ctx context.Context) {
 // Helpers
 
 func (s *DistributedBadger) proposeTxnSubCommand(ctx context.Context, performOps func(context.Context, *Txn) error) error {
-	// Re-check under lock: leadership may have changed between the !IsLeader()
-	// guard in the caller and reaching here (TOCTOU). getTM() is the
-	// authoritative, race-free gate for all leader-only mutations.
-	tm, err := s.getTM()
-	if err != nil {
-		return err
-	}
-	txn, err := tm.BeginTxn(ctx, true)
+	txn, err := s.tm.BeginTxn(ctx, true)
 	if err != nil {
 		s.log.Error("Failed to begin transaction", zap.Error(err))
 		return err
@@ -558,7 +502,7 @@ func (s *DistributedBadger) proposeAndWait(cmd *types.Command) error {
 	s.proposals.Store(cmd.Id, errCh)
 
 	start := time.Now()
-	s.node.ProposeNotifier() <- b
+	s.node.ProposeReqNotifier() <- propose{cmdID: cmd.Id, cmd: b}
 
 	select {
 	case err := <-errCh:

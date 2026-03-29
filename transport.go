@@ -52,7 +52,7 @@ func NewTransport(id uint64, peers map[uint64]string, log *zap.Logger) *Transpor
 
 func (tr *Transport) Start(ctx context.Context, cfg *Config, node *Node, snapshotter *snap.Snapshotter) {
 	tr.raftTr = &rafthttp.Transport{
-		Logger:      tr.log, //TODO: P0: Fix me
+		// Logger:      tr.log, //TODO: P0: Fix me
 		DialTimeout: cfg.PeerDialTimeout(),
 		ID:          etcdtypes.ID(tr.id),
 		ClusterID:   etcdtypes.ID(node.cluster.GetID()),
@@ -80,6 +80,7 @@ func (tr *Transport) Start(ctx context.Context, cfg *Config, node *Node, snapsho
 
 	for i := range tr.peers {
 		if i != tr.id {
+			tr.log.Info("Adding peer to raft transport", zap.Uint64("peerId", i), zap.String("address", tr.peers[i]))
 			tr.raftTr.AddPeer(etcdtypes.ID(i), []string{tr.peers[i]})
 		}
 	}

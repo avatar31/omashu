@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/avatar31/omashu/types"
 	"github.com/avatar31/omashu/utils"
 	"github.com/dgraph-io/badger/v4"
 	"github.com/dgraph-io/badger/v4/y"
@@ -140,44 +141,61 @@ type TSO struct {
 	mu  sync.Mutex
 }
 
-// newTSO() initializes a new TSO instance. It loads the last saved upper bound timestamp from the database,
-// calibrates the TSO clock if necessary, and starts a background goroutine to periodically update the upper bound timestamp.
-// It also initializes the read and transaction watermarks based on the current timestamp.
-func newTSO(ctx context.Context, db *DistributedBadger, log *zap.Logger) (*TSO, error) {
-	tso := &TSO{
+// newTSO() initializes a new TSO instance.
+func newTSO(db *DistributedBadger, log *zap.Logger) *TSO {
+	return &TSO{
 		current: newEmptyTimeStamp(),
 		saved:   newEmptyTimeStamp(),
 
-		readMark:     &y.WaterMark{Name: "badger.PendingReads"},
-		txnMark:      &y.WaterMark{Name: "badger.TxnTimestamp"},
-		closer:       z.NewCloser(2),
-		stopNotifier: make(chan struct{}),
-
-		readers: make(map[uint64]struct{}),
+		readMark: &y.WaterMark{Name: "badger.PendingReads"},
+		txnMark:  &y.WaterMark{Name: "badger.TxnTimestamp"},
+		readers:  make(map[uint64]struct{}),
 
 		db:  db,
-		log: log.With(zap.String("sub_module", "tso")),
+		log: log.With(zap.String("subModule", "tso")),
 	}
+}
+
+// StartServing() starts service timestamps for transactions.
+// It loads the last saved upper bound timestamp from the database, calibrates the TSO clock if necessary,
+// and starts a background goroutine to periodically update the upper bound timestamp.
+// It also initializes the read and transaction watermarks based on the current timestamp.
+func (tso *TSO) StartServing(ctx context.Context) error {
+	tso.stopNotifier = make(chan struct{})
+
+	// Initialize markers
+	tso.closer = z.NewCloser(2)
 	tso.readMark.Init(tso.closer)
 	tso.txnMark.Init(tso.closer)
 
-	val, found, err := db.Get(ctx, persistentKey)
+	val, found, err := tso.db.getVal(ctx, persistentKey, true)
 	if err != nil {
 		tso.log.Error("Failed to load last TSO from DB", zap.Error(err))
-		return nil, err
+		return err
 	}
 
 	if found {
 		last := int64(utils.BytesToUint64(val))
-		now := time.Now().UnixMilli()
-		if now <= last {
-			now = last + 1
+		tso.log.Info("Loaded last TSO from DB", zap.Int64("lastTso", last))
+		tso.saved.Reset(last)
+
+		current := time.Now().UnixMilli()
+		if current <= last {
+			current = last + 1
 		}
 
-		tso.current.Reset(now)
+		tso.log.Info("Starting TSO with timestamp", zap.Int64("timestamp", current))
+		tso.current.Reset(current)
 		tso.calibrate()
 	} else {
-		tso.current.Reset(time.Now().UnixMilli())
+		now := time.Now().UnixMilli()
+		tso.log.Info("No existing TSO found in DB, starting TSO with timestamp", zap.Int64("timestamp", now))
+		tso.current.Reset(now)
+	}
+
+	err = tso.persistUpperboundOnStartup(ctx)
+	if err != nil {
+		return err
 	}
 
 	go tso.windowUpdator(ctx)
@@ -186,19 +204,16 @@ func newTSO(ctx context.Context, db *DistributedBadger, log *zap.Logger) (*TSO, 
 	tso.readMark.SetDoneUntil(lastIndex)
 	tso.txnMark.SetDoneUntil(lastIndex)
 
-	return tso, nil
+	return nil
 }
 
 // windowUpdator() is a background goroutine that periodically checks if the current physical time
 // plus a predefined upper bound window exceeds the saved upper bound timestamp.
 func (tso *TSO) windowUpdator(ctx context.Context) {
-	if err := tso.UpdateWindow(ctx); err != nil {
-		tso.log.Error("Failed to update TSO window even after multiple retries", zap.Error(err))
-	}
-
-	tso.log.Info("TSO window updated successfully, starting ticker for periodic updates with interval",
+	tso.log.Info("Starting ticker for periodic updates with interval",
 		zap.Duration("interval", defaultUpperBoundWindow))
 	ticker := time.NewTicker(defaultUpperBoundWindow)
+	defer ticker.Stop()
 
 	for {
 		select {
@@ -208,10 +223,8 @@ func (tso *TSO) windowUpdator(ctx context.Context) {
 			}
 		case <-tso.stopNotifier:
 			tso.log.Info("Received stop signal, stopping TSO window updator")
-			ticker.Stop()
 			return
 		case <-ctx.Done():
-			ticker.Stop()
 			return
 		}
 	}
@@ -227,7 +240,7 @@ func (tso *TSO) calibrate() {
 	now := time.Now().UnixMilli()
 	if now < tso.current.physical {
 		wait := time.Duration(tso.current.physical-now) * time.Millisecond
-		tso.log.Warn("Fencing TSO clock", zap.Int64("wait_ms", int64(wait/time.Millisecond)))
+		tso.log.Warn("Fencing TSO clock", zap.Int64("waitMs", int64(wait/time.Millisecond)))
 		time.Sleep(wait)
 	}
 }
@@ -258,7 +271,7 @@ func (tso *TSO) allocate() uint64 { // Must be called under tso.mu.Lock
 			// wait for window to be updated
 			time.Sleep(time.Millisecond / 2)
 		}
-		tso.log.Info("Window updated, resuming timestamp allocation", zap.Duration("wait_time", time.Since(startTime)))
+		tso.log.Info("Window updated, resuming timestamp allocation", zap.Duration("waitTime", time.Since(startTime)))
 	}
 
 	// Step 3: handle logical overflow
@@ -274,7 +287,8 @@ func (tso *TSO) allocate() uint64 { // Must be called under tso.mu.Lock
 			// wait for physical time to advance
 			time.Sleep(time.Millisecond / 2)
 		}
-		tso.log.Info("Physical time advanced, resuming timestamp allocation", zap.Duration("wait_time", time.Since(startTime)))
+		tso.log.Info("Physical time advanced, resuming timestamp allocation",
+			zap.Duration("waitTime", time.Since(startTime)))
 	}
 
 	// Step 4: allocate timestamp
@@ -291,13 +305,18 @@ func (tso *TSO) allocate() uint64 { // Must be called under tso.mu.Lock
 // to immediately persist a new upper bound.
 func (tso *TSO) UpdateWindow(ctx context.Context) error {
 	tso.mu.Lock()
-	defer tso.mu.Unlock()
+	current := tso.current.physical
+	saved := tso.saved.physical
+	tso.mu.Unlock()
 
-	upperBound := tso.current.physical + defaultUpperBoundWindow.Milliseconds()
-	if upperBound <= tso.saved.physical {
-		// no need to update
+	upperBound := current + defaultUpperBoundWindow.Milliseconds()
+	if saved != 0 && upperBound <= saved {
+		tso.log.Debug("Upper bound is still sufficient, no need to update", zap.Int64("current", current),
+			zap.Int64("saved", saved), zap.Int64("upperbound", upperBound)) // TODO: P0: Remove me
 		return nil
 	}
+
+	tso.log.Info("Updating persistent key to new upperbound", zap.Int64("upperbound", upperBound))
 
 	// persist the upper bound to DB
 	// TODO: P1: Use retry on failure due to transaction conflicts
@@ -309,7 +328,43 @@ func (tso *TSO) UpdateWindow(ctx context.Context) error {
 		return err
 	}
 
+	tso.mu.Lock()
 	tso.saved.Reset(upperBound)
+	tso.mu.Unlock()
+
+	tso.log.Info("Updated persistent key to new upperbound", zap.Int64("upperbound", upperBound))
+	return nil
+}
+
+// persistUpperboundOnStartup() is called during TSO startup to persist an initial upper bound timestamp to the database.
+// Here we are directly proposing raft using 1st valid timestamp to ensure that the upper bound is persisted before 
+// we start serving timestamps. This is important because if the TSO crashes before persisting the upper bound, the next 
+// elected leader might start with a timestamp that is too old, which can lead to non-monotonic timestamps being generated 
+// and potential consistency issues. 
+// By persisting the upper bound on startup, we ensure that there is always a valid upper bound in the database that the 
+// TSO can use to calibrate its clock and generate timestamps safely.
+func (tso *TSO) persistUpperboundOnStartup(ctx context.Context) error {
+	tso.mu.Lock()
+	current := tso.current.physical
+	tso.current.Incr()
+	ts := tso.current.Compose()
+	tso.mu.Unlock()
+
+	upperBound := current + defaultUpperBoundWindow.Milliseconds()
+	cmd := types.NewSetCommand(ctx, persistentKey, utils.Uint64ToBytes(uint64(upperBound)))
+	cmd.ReadTs = ts
+	cmd.CommitTs = ts
+
+	err := tso.db.proposeAndWait(cmd)
+	if err != nil {
+		tso.log.Error("Failed to persist upper bound on startup", zap.Error(err))
+		return err
+	}
+
+	tso.mu.Lock()
+	tso.saved.Reset(upperBound)
+	tso.mu.Unlock()
+
 	tso.log.Info("Updated persistent key to new upperbound", zap.Int64("upperbound", upperBound))
 	return nil
 }
@@ -330,10 +385,8 @@ func (tso *TSO) currentReadTs() uint64 {
 // process to be visible. This ensures that any transaction that reads at this timestamp will see all committed
 // transactions up to this point, maintaining consistency.
 func (tso *TSO) ReadTs(ctx context.Context) (uint64, error) {
-	var readTs uint64
 	tso.mu.Lock()
-	readTs = tso.currentReadTs()
-	tso.readMark.Begin(readTs)
+	readTs := tso.currentReadTs()
 
 	// Record readTs in the readers map so that DoneRead() can later call
 	// readMark.Done(). Without this, the readMark watermark never advances,
@@ -341,11 +394,7 @@ func (tso *TSO) ReadTs(ctx context.Context) (uint64, error) {
 	tso.readers[readTs] = struct{}{}
 	tso.mu.Unlock()
 
-	start := time.Now()
-	defer func() {
-		elapsed := time.Since(start)
-		tso.log.Debug("TSO ReadTs wait time", zap.Duration("elapsed", elapsed), zap.Uint64("readTs", readTs))
-	}()
+	tso.readMark.Begin(readTs)
 
 	// Wait for all txns which have no conflicts, have been assigned a commit
 	// timestamp and are going through the write to value log and LSM tree
@@ -357,6 +406,8 @@ func (tso *TSO) ReadTs(ctx context.Context) (uint64, error) {
 		tso.log.Error("Failed to wait for txn mark in ReadTs", zap.Error(err), zap.Uint64("readTs", readTs))
 		return 0, err
 	}
+
+	tso.log.Debug("Assigned read timestamp", zap.Uint64("readTs", readTs))
 	return readTs, nil
 }
 
@@ -399,15 +450,15 @@ func (tso *TSO) newCommitTs(txn *Txn) (uint64, bool) {
 	return ts, false
 }
 
-// Commit() is a helper function that generates a commit timestamp for a transaction and executes 
+// Commit() is a helper function that generates a commit timestamp for a transaction and executes
 // the provided function with that timestamp.
 func (tso *TSO) Commit(txn *Txn, fn func(ts uint64) error) error {
 	ts, conflict := tso.newCommitTs(txn)
-    if conflict {
-        return badger.ErrConflict
-    }
+	if conflict {
+		return badger.ErrConflict
+	}
 
-    defer tso.DoneCommit(ts)
+	defer tso.DoneCommit(ts)
 	return fn(ts)
 }
 
@@ -502,6 +553,8 @@ func (tso *TSO) DoneCommit(cts uint64) {
 // Close() stops the TSO's watermarks and any background goroutines. It should be called when the
 // TSO is no longer needed to clean up resources.
 func (tso *TSO) Close() {
-	close(tso.stopNotifier)
+	if tso.stopNotifier != nil {
+		close(tso.stopNotifier)
+	}
 	tso.closer.Done()
 }

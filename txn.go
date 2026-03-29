@@ -32,8 +32,10 @@ func newTxnManager(db *DistributedBadger, tso *TSO, log *zap.Logger) *TxnManager
 func (tm *TxnManager) BeginTxn(ctx context.Context, update bool) (*Txn, error) {
 	readTs, err := tm.tso.ReadTs(ctx)
 	if err != nil {
+		tm.log.Error("Error getting read timestamp from TSO", zap.Error(err))
 		return nil, err
 	}
+
 	cmd := types.NewTransactionCommand(ctx)
 	cmd.ReadTs = readTs
 	return &Txn{

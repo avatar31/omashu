@@ -13,7 +13,7 @@ import (
 )
 
 func newLogger(module string, log *zap.Logger) raft.Logger {
-	return &zapRaftLogger{log: log.With(zap.String("sub_module", module))}
+	return &zapRaftLogger{log: log.With(zap.String("subModule", module))}
 }
 
 type zapRaftLogger struct {
