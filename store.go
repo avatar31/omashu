@@ -75,15 +75,13 @@ type Database[T OTxn] interface {
 type DistributedBadger struct {
 	proposals            sync.Map
 	leaderChangeNotifier chan struct{}
+	muLCNotifier         sync.RWMutex 	// TODO: P0: Do we need this mutex?
 
 	fsm  *FSM
 	node *Node
 	tso  *TSO
 	tm   *TxnManager
 	log  *zap.Logger
-
-	// mu guards tso, tm, and leaderChangeNotifier
-	mu sync.RWMutex
 
 	onLeaderChangeHook func(prevLeader, newLeader uint64)
 	onRemovedSelfHook  func()
