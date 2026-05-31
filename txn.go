@@ -19,16 +19,25 @@ import (
 	"github.com/avatar31/omashu/types"
 )
 
+// TxnManager creates and tracks transactions for a [DistributedBadger] node.
+// It is only active when the node is the Raft leader; the TSO must be
+// serving before any transaction can be started.
 type TxnManager struct {
 	db  *DistributedBadger
 	tso *TSO
 	log *zap.Logger
 }
 
+// newTxnManager creates a TxnManager for db backed by tso.
 func newTxnManager(db *DistributedBadger, tso *TSO, log *zap.Logger) *TxnManager {
 	return &TxnManager{db: db, tso: tso, log: log}
 }
 
+// BeginTxn opens a new transaction. It requests a read timestamp from the
+// TSO, which blocks until all previously committed writes are visible at
+// that timestamp. Set update to true for read-write transactions; false
+// returns a read-only transaction whose write methods return
+// badger.ErrReadOnlyTxn.
 func (tm *TxnManager) BeginTxn(ctx context.Context, update bool) (*Txn, error) {
 	readTs, err := tm.tso.ReadTs(ctx)
 	if err != nil {
@@ -53,6 +62,10 @@ func (tm *TxnManager) BeginTxn(ctx context.Context, update bool) (*Txn, error) {
 	}, nil
 }
 
+// Txn is a read-write transaction with snapshot isolation. Reads are served
+// from the MVCC snapshot at readTs; writes are buffered as sub-commands on
+// cmd and only become visible after Commit successfully proposes them to
+// Raft at commitTs. Txn is not safe for concurrent use.
 type Txn struct {
 	id  string
 	cmd *types.Command
@@ -73,16 +86,27 @@ type Txn struct {
 	discarded bool
 }
 
+// addReadKey records key as having been read during this transaction.
+// Called by read helpers so the TSO can check for write-read conflicts at
+// commit time. Safe to call from multiple goroutines.
 func (txn *Txn) addReadKey(key string) {
 	txn.readsLock.Lock()
 	defer txn.readsLock.Unlock()
 	txn.reads = append(txn.reads, key)
 }
 
+// AddWriteKey registers key as a write participant without adding a
+// sub-command. Used internally by validate and by callers that must track
+// a write for conflict detection before the command is constructed.
 func (txn *Txn) AddWriteKey(key string) {
 	txn.writes = append(txn.writes, key)
 }
 
+// Commit requests a commit timestamp from the TSO, verifies there are no
+// write-read conflicts with concurrent transactions, stamps the buffered
+// command with the commit timestamp, and returns it ready for Raft
+// proposal. Returns (nil, nil) when the transaction has no writes.
+// Always calls Discard before returning.
 func (txn *Txn) Commit() (*types.Command, error) {
 	if txn.discarded {
 		return nil, badger.ErrDiscardedTxn
@@ -119,6 +143,10 @@ func (txn *Txn) Commit() (*types.Command, error) {
 	return txn.cmd, nil
 }
 
+// Discard marks the transaction as done and advances the TSO readMark
+// watermark for this transaction's readTs, allowing the TSO to clean up
+// committed transactions that are no longer needed for conflict detection.
+// Discard is idempotent and safe to call after Commit.
 func (txn *Txn) Discard() {
 	if txn.discarded { // Avoid a re-run.
 		return
@@ -130,6 +158,8 @@ func (txn *Txn) Discard() {
 
 // DB Ops
 
+// IncrBy buffers an INCR_BY sub-command that increments the counter at key
+// by delta when the transaction commits.
 func (txn *Txn) IncrBy(ctx context.Context, key string, delta uint64) error {
 	err := txn.validate(key)
 	if err != nil {
@@ -140,6 +170,8 @@ func (txn *Txn) IncrBy(ctx context.Context, key string, delta uint64) error {
 	return nil
 }
 
+// DecrBy buffers a DECR_BY sub-command that decrements the counter at key
+// by delta when the transaction commits.
 func (txn *Txn) DecrBy(ctx context.Context, key string, delta uint64) error {
 	err := txn.validate(key)
 	if err != nil {
@@ -150,6 +182,8 @@ func (txn *Txn) DecrBy(ctx context.Context, key string, delta uint64) error {
 	return nil
 }
 
+// Set buffers a SET sub-command that stores value at key (with optional TTL)
+// when the transaction commits.
 func (txn *Txn) Set(ctx context.Context, key string, value []byte, ttl ...time.Duration) error {
 	err := txn.validate(key)
 	if err != nil {
@@ -160,6 +194,8 @@ func (txn *Txn) Set(ctx context.Context, key string, value []byte, ttl ...time.D
 	return nil
 }
 
+// Delete buffers a DELETE sub-command that removes key when the transaction
+// commits. A missing key is a no-op.
 func (txn *Txn) Delete(ctx context.Context, key string) error {
 	err := txn.validate(key)
 	if err != nil {
@@ -170,6 +206,9 @@ func (txn *Txn) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+// DeleteByPrefix buffers a DELETE_BY_PREFIX sub-command that removes all
+// keys matching prefix when the transaction commits. It resolves the current
+// set of matching keys immediately (at readTs) for conflict tracking.
 func (txn *Txn) DeleteByPrefix(ctx context.Context, prefix string) error {
 	keys, err := txn.db.GetKeysByPrefixWithTxn(ctx, txn, prefix)
 	if err != nil {
@@ -187,6 +226,8 @@ func (txn *Txn) DeleteByPrefix(ctx context.Context, prefix string) error {
 	return nil
 }
 
+// UpdateJson buffers an UPDATE sub-command that JSON-merges delta into the
+// existing value at key when the transaction commits.
 func (txn *Txn) UpdateJson(ctx context.Context, key string, delta map[string]any, ttl ...time.Duration) error {
 	err := txn.validate(key)
 	if err != nil {
@@ -202,6 +243,10 @@ func (txn *Txn) UpdateJson(ctx context.Context, key string, delta map[string]any
 	return nil
 }
 
+// UpdateProtobuf buffers an UPDATE sub-command that performs a field-level
+// Protobuf merge into the existing value at key when the transaction commits.
+// Returns [ErrUnknownProtoMsg] if deltaProtoMsg's type is not registered in
+// the global descriptor store.
 func (txn *Txn) UpdateProtobuf(ctx context.Context, key string, deltaProtoMsg proto.Message,
 	ttl ...time.Duration) error {
 	err := txn.validate(key)
@@ -230,6 +275,9 @@ func (txn *Txn) UpdateProtobuf(ctx context.Context, key string, deltaProtoMsg pr
 	return nil
 }
 
+// validate checks that the transaction is still usable and that key is
+// non-empty. On success it records key in the conflict set and the write
+// list for TSO conflict detection at commit time.
 func (txn *Txn) validate(key string) error {
 	switch {
 	case !txn.update:

@@ -209,6 +209,16 @@ err = db.NewTransaction(ctx, func(ctx context.Context, txn *omashu.Txn) error {
 
 > **Note:** On `DistributedBadger`, only the **leader node** accepts write transactions. A write on a non-leader returns `omashu.ErrNotLeader`.
 
+> **Other `WithTxn` read variants** available inside `performOps`:
+> - `db.GetByPrefixWithTxn(ctx, txn, prefix)` — all key-value pairs matching a prefix at `readTs`
+> - `db.GetKeysByPrefixWithTxn(ctx, txn, prefix)` — matching keys only
+>
+> All read keys are automatically registered for conflict detection at commit time.
+
+> **Conflict detection:** If any key read inside the transaction was also written by a concurrent
+> transaction that committed after your `readTs`, `Txn.Commit` returns `badger.ErrConflict`.
+> Retry the transaction in that case. (Automatic retry is a tracked P1 improvement.)
+
 ---
 
 ## Configuration Reference
@@ -228,6 +238,15 @@ err = db.NewTransaction(ctx, func(ctx context.Context, txn *omashu.Txn) error {
 | `RaftConfig` | `*RaftConfig` | Distributed only | Raft node ID, tuning, and peer addresses |
 | `OnLeaderChange` | `func(prev, next uint64)` | No | Callback invoked when the Raft leader changes |
 | `OnRemovedSelf` | `func()` | No | Callback invoked when this node is removed from the cluster |
+
+### Key Constants
+
+| Constant | Value | Description |
+|---|---|---|
+| `DefaultProposeTimeout` | `5s` | Maximum time a Raft proposal can take before [`ErrProposeTimeout`](#error-reference) is returned |
+| `MaxBatchSize` | `100` | Maximum sub-commands per `NewTransaction` call before [`ErrBatchTooBig`](#error-reference) |
+| `RetryCount` | `5` | Retry limit for recoverable node operations |
+| `LOGICAL_BITS` | `18` | Bits for the logical counter in the HLC timestamp (up to 262,143 ticks/ms) |
 
 ### SchemaConfig
 
@@ -311,6 +330,7 @@ RaftConfig: &omashu.RaftConfig{
 | **FSM** | Applies committed Raft log entries and snapshots to BadgerDB |
 | **Storage** | Persists Raft hard state, WAL entries, and snapshots to disk |
 | **Transport** | HTTP peer-to-peer message passing using etcd's `rafthttp` package |
+| **Replicator** | Full-database snapshot capture (`TakeSnapshot`) and restore (`Restore`) via BadgerDB Backup/Load; produces the data embedded in Raft snapshots |
 
 ### Transaction Flow (Distributed)
 
@@ -353,7 +373,7 @@ The upper bound is persisted to BadgerDB so that a newly elected leader can safe
 |---|---|
 | `ErrNotLeader` | Write or transaction attempted on a non-leader node |
 | `ErrProposeTimeout` | Raft did not commit the proposal within the timeout (default: 5 s) |
-| `ErrBatchTooBig` | Transaction write set exceeds `MaxBatchSize` |
+| `ErrBatchTooBig` | Transaction write set exceeds `MaxBatchSize` (= 100) |
 | `ErrMissingRaftConf` | `RaftConfig` not provided when calling `NewDistributedBadger` |
 | `ErrMissingCluster` | `Cluster` field not set in `Config` |
 | `ErrMissingBaseDir` | `BaseDir` field not set in `Config` |
@@ -362,6 +382,7 @@ The upper bound is persisted to BadgerDB so that a newly elected leader can safe
 | `ErrUnknownOp` | FSM received an unrecognised command type (indicates an internal bug) |
 | `badger.ErrReadOnlyTxn` | Write operation called on a read-only `Txn` |
 | `badger.ErrDiscardedTxn` | Any operation called on a `Txn` after `Discard()` or after `Commit()` |
+| `badger.ErrConflict` | Returned by `Txn.Commit` when a read key was written by a concurrent transaction that committed after `readTs`; retry the transaction |
 
 ---
 

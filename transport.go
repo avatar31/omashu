@@ -27,10 +27,16 @@ import (
 // 2. Implement TLS support for secure communication between nodes
 // 3. Add metrics and logging for transport operations
 
+// defaultReqTimeout is the per-request timeout applied to the HTTP server
+// that serves inbound Raft peer traffic.
 const (
 	defaultReqTimeout = 5 * time.Second
 )
 
+// Transport manages HTTP-based peer-to-peer Raft message delivery using
+// etcd's rafthttp package. It handles both outbound message sending and
+// inbound request serving for all Raft protocol messages including
+// heartbeats, log entries, and snapshots.
 type Transport struct {
 	id     uint64
 	raftTr *rafthttp.Transport
@@ -42,6 +48,9 @@ type Transport struct {
 	log *zap.Logger
 }
 
+// NewTransport creates a Transport for the node identified by id.
+// peers maps every cluster member's node ID (including this node's own ID)
+// to its "http://host:port" address.
 func NewTransport(id uint64, peers map[uint64]string, log *zap.Logger) *Transport {
 	return &Transport{
 		id:    id,
@@ -50,6 +59,10 @@ func NewTransport(id uint64, peers map[uint64]string, log *zap.Logger) *Transpor
 	}
 }
 
+// Start initialises the rafthttp transport, registers all known peers, and
+// starts the HTTP server that receives inbound Raft messages. Any fatal
+// error during setup is sent to node.errChan so the Raft ready loop can
+// shut down cleanly.
 func (tr *Transport) Start(ctx context.Context, cfg *Config, node *Node, snapshotter *snap.Snapshotter) {
 	tr.raftTr = &rafthttp.Transport{
 		// Logger:      tr.log, //TODO: P0: Fix me
@@ -100,10 +113,15 @@ func (tr *Transport) Start(ctx context.Context, cfg *Config, node *Node, snapsho
 	}()
 }
 
+// Send dispatches outbound Raft messages to their destination peers.
+// Messages are handed to rafthttp which handles connection pooling and
+// retries internally.
 func (tr *Transport) Send(ctx context.Context, messages []raftpb.Message) {
 	tr.raftTr.Send(messages)
 }
 
+// AddPeer registers a new peer with the given id and HTTP address.
+// It is safe to call concurrently and supports dynamic cluster membership.
 func (tr *Transport) AddPeer(ctx context.Context, id uint64, addr string) {
 	tr.raftTr.AddPeer(etcdtypes.ID(id), []string{addr})
 	tr.mu.Lock()
@@ -112,6 +130,8 @@ func (tr *Transport) AddPeer(ctx context.Context, id uint64, addr string) {
 	tr.log.Info(fmt.Sprintf("Added peer %d with address %s", id, addr))
 }
 
+// RemovePeer deregisters the peer identified by id and closes any open
+// connections to it. Used when a node is removed from the cluster.
 func (tr *Transport) RemovePeer(ctx context.Context, id uint64) {
 	tr.raftTr.RemovePeer(etcdtypes.ID(id))
 	tr.mu.Lock()
@@ -120,6 +140,9 @@ func (tr *Transport) RemovePeer(ctx context.Context, id uint64) {
 	tr.log.Info(fmt.Sprintf("Removed peer %d", id))
 }
 
+// UpdatePeer replaces the HTTP address for the peer identified by id.
+// Use this when a peer's network address changes without a cluster
+// membership change.
 func (tr *Transport) UpdatePeer(ctx context.Context, id uint64, addr string) {
 	tr.raftTr.UpdatePeer(etcdtypes.ID(id), []string{addr})
 	tr.mu.Lock()
@@ -128,6 +151,8 @@ func (tr *Transport) UpdatePeer(ctx context.Context, id uint64, addr string) {
 	tr.log.Info(fmt.Sprintf("Updated peer %d with new address %s", id, addr))
 }
 
+// Stop gracefully shuts down the HTTP server (with a 5-second drain
+// window) and the underlying rafthttp transport.
 func (tr *Transport) Stop() error {
 	tr.raftTr.Stop()
 	if tr.server != nil {

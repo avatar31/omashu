@@ -15,6 +15,9 @@ import (
 	"go.uber.org/zap"
 )
 
+// Storage implements the raft.Storage interface and bridges the etcd
+// raft.MemoryStorage with a persistent WAL and Snapshotter. It serialises
+// concurrent reads and writes with a read-write mutex.
 type Storage struct {
 	wal        *Wal
 	memStorage *raft.MemoryStorage
@@ -23,6 +26,8 @@ type Storage struct {
 	log *zap.Logger
 }
 
+// newStorage creates a Storage backed by a Wal rooted at baseDir. The
+// in-memory raft.MemoryStorage is not populated until Initialize is called.
 func newStorage(baseDir string, log *zap.Logger) (*Storage, error) {
 	s := &Storage{log: log}
 	wal, err := newWal(baseDir, s.log)
@@ -34,6 +39,10 @@ func newStorage(baseDir string, log *zap.Logger) (*Storage, error) {
 	return s, nil
 }
 
+// Initialize replays the WAL into raft.MemoryStorage. It loads the latest
+// snapshot (if any), restores the hard state, and appends all subsequent WAL
+// entries so that the storage is ready for raft.RestartNode or
+// raft.StartNode. Must be called exactly once after newStorage.
 func (s *Storage) Initialize(ctx context.Context) error {
 	s.memStorage = raft.NewMemoryStorage()
 	latestSnap, hardState, entries, err := s.wal.Open(ctx)
@@ -83,6 +92,10 @@ func (s *Storage) Initialize(ctx context.Context) error {
 	return nil
 }
 
+// SaveState persists the Raft Ready state: snapshot file, hard state, and
+// log entries. The snapshot and WAL entry are always written first to
+// ensure safe recovery after a crash mid-Ready. The in-memory storage is
+// then updated to match. Must be called on every Ready before Advance.
 func (s *Storage) SaveState(ctx context.Context, rd *raft.Ready) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -117,6 +130,10 @@ func (s *Storage) SaveState(ctx context.Context, rd *raft.Ready) error {
 	return nil
 }
 
+// saveStateToWal writes the snapshot file (if present), hard state, and log
+// entries to the WAL, then syncs and releases the WAL lock. Callers must
+// hold s.mu (exclusive). The snapshot is persisted before the WAL entry to
+// avoid an unrecoverable WAL entry with no corresponding snapshot file.
 func (s *Storage) saveStateToWal(rd *raft.Ready) error {
 	if !raft.IsEmptySnap(rd.Snapshot) {
 		if err := s.wal.SaveSnap(&rd.Snapshot); err != nil {
@@ -146,11 +163,15 @@ func (s *Storage) saveStateToWal(rd *raft.Ready) error {
 	return nil
 }
 
+// Existing reports whether the WAL directory contained data before this
+// storage was opened. The node uses this to distinguish a new cluster member
+// (raft.StartNode) from a rejoining one (raft.RestartNode).
 func (s *Storage) Existing() bool {
 	return s.wal.ExistingWAL()
 }
 
-// LastSnapshotIndex returns the index of the last snapshot
+// LastSnapshotIndex returns the Raft log index of the most recent snapshot
+// held in memory storage, or 0 if no snapshot exists yet.
 func (s *Storage) LastSnapshotIndex() uint64 {
 	snap, err := s.memStorage.Snapshot()
 	if err != nil {
@@ -159,8 +180,10 @@ func (s *Storage) LastSnapshotIndex() uint64 {
 	return snap.Metadata.Index
 }
 
-// CreateSnapshot creates a new snapshot at the given index with the provided data
-// This is typically called by the application when it wants to compact the log
+// CreateSnapshot captures the application state (data) at the given log index,
+// writes the snapshot file and WAL entry, applies the snapshot to memory
+// storage, syncs, and compacts the memory log up to index. Typically called
+// by takeSnapshotIfNeeded after the FSM produces a snapshot.
 func (s *Storage) CreateSnapshot(index uint64, confState raftpb.ConfState, data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -217,15 +240,18 @@ func (s *Storage) CreateSnapshot(index uint64, confState raftpb.ConfState, data 
 	return nil
 }
 
+// Compact advances the memory storage compaction frontier to index, freeing
+// log entries no longer needed. Safe to call if storage is already compacted
+// past index.
 func (s *Storage) Compact(index uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.compact(index)
 }
 
-// Compact the memory storage
-// This removes entries up to and including the snapshot index
-// These entries are no longer needed since they're in the snapshot
+// compact removes log entries from memory storage up to and including index.
+// Callers must hold s.mu (exclusive). ErrCompacted is swallowed silently
+// since it means storage is already at least as compact as requested.
 func (s *Storage) compact(index uint64) error {
 	if err := s.memStorage.Compact(index); err != nil {
 		if err == raft.ErrCompacted {
@@ -240,45 +266,55 @@ func (s *Storage) compact(index uint64) error {
 	return nil
 }
 
+// Close flushes and closes the WAL. Must be called exactly once when the
+// Raft node shuts down.
 func (s *Storage) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.wal.Close()
 }
 
-// ---- Implement raft.Storage interface ----
-// These methods delegate to MemoryStorage
+// The following methods implement the raft.Storage interface. Each acquires
+// a read lock and delegates to the underlying raft.MemoryStorage.
 
+// InitialState returns the saved HardState and ConfState for this node.
 func (s *Storage) InitialState() (raftpb.HardState, raftpb.ConfState, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.memStorage.InitialState()
 }
 
+// Entries returns log entries in the half-open range [lo, hi). maxSize
+// limits the total byte size of the returned slice.
 func (s *Storage) Entries(lo, hi, maxSize uint64) ([]raftpb.Entry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.memStorage.Entries(lo, hi, maxSize)
 }
 
+// Term returns the term of the log entry at index i.
 func (s *Storage) Term(i uint64) (uint64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.memStorage.Term(i)
 }
 
+// LastIndex returns the index of the last entry in the log.
 func (s *Storage) LastIndex() (uint64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.memStorage.LastIndex()
 }
 
+// FirstIndex returns the index of the first log entry that has not yet been
+// compacted (entries before it are no longer available).
 func (s *Storage) FirstIndex() (uint64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.memStorage.FirstIndex()
 }
 
+// Snapshot returns the most recent snapshot held in memory storage.
 func (s *Storage) Snapshot() (raftpb.Snapshot, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

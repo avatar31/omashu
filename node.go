@@ -18,6 +18,10 @@ import (
 	"go.uber.org/zap"
 )
 
+// defaultSnapshotCount is the number of committed log entries between
+// automatic snapshots. RetryCount is the maximum retry attempts for
+// recoverable operations. ReadStatesTimeout is the per-read-index wait
+// deadline before returning a timeout error.
 const (
 	defaultSnapshotCount = 100000 // Number of entries between snapshots
 	RetryCount           = 5
@@ -28,12 +32,19 @@ const (
 // server/etcdserver/raft.go
 // server/etcdserver/bootstrap.go
 
+// propose carries a single Raft proposal through the request/response
+// pipeline. cmdID uniquely identifies the proposal; ErrResp is non-nil
+// when the Raft layer reports a failure.
 type propose struct {
 	cmdID   string
 	cmd     []byte
 	ErrResp error
 }
 
+// Node manages the lifecycle of a single Raft cluster member. It drives the
+// etcd/raft state machine by processing Ready events, forwarding proposals,
+// detecting leader changes, applying committed entries to the FSM, and taking
+// periodic snapshots to bound recovery time after a restart.
 type Node struct {
 	id    uint64
 	name  string
@@ -68,6 +79,9 @@ type Node struct {
 	log *zap.Logger
 }
 
+// newNode allocates and initialises a Node for the given id and nodename.
+// peers maps every cluster member's ID (including this node) to its HTTP
+// address. The node is not started until Start is called.
 func newNode(id uint64, nodename string, peers map[uint64]string, fsm *FSM, log *zap.Logger) (*Node, error) {
 	node := &Node{
 		id:                  id,
@@ -86,6 +100,10 @@ func newNode(id uint64, nodename string, peers map[uint64]string, fsm *FSM, log 
 	return node, nil
 }
 
+// Start initialises the Raft storage, configures the raft.Node from cfg,
+// starts the peer transport, and launches the readyHandler and
+// proposeHandler goroutines. If a WAL already exists the node is restarted
+// from its persisted state; otherwise it starts as a new cluster member.
 func (node *Node) Start(ctx context.Context, cfg *Config) error {
 	node.cluster = cfg.Cluster
 	storage, err := newStorage(cfg.BaseDir, node.log)
@@ -141,6 +159,11 @@ func (node *Node) Start(ctx context.Context, cfg *Config) error {
 	return nil
 }
 
+// readyHandler is the main Raft event loop. It ticks the Raft timer every
+// 100 ms and processes each Ready batch — persisting state, sending messages,
+// applying snapshots, and committing entries to the FSM — before calling
+// Advance. Runs in its own goroutine until ctx is cancelled or a fatal error
+// is received.
 func (node *Node) readyHandler(ctx context.Context) {
 	defer node.Stop(ctx)
 
@@ -189,6 +212,10 @@ func (node *Node) readyHandler(ctx context.Context) {
 	}
 }
 
+// proposeHandler receives proposals from proposeReqNotifier, forwards them
+// to the Raft node, and returns the result on proposeRespNotifier. It also
+// handles configuration-change proposals. Runs in its own goroutine until
+// ctx is cancelled or a fatal error is sent to errChan.
 func (node *Node) proposeHandler(ctx context.Context) {
 	for {
 		select {
@@ -230,12 +257,15 @@ func (node *Node) proposeHandler(ctx context.Context) {
 	}
 }
 
-// Steps:
-// 1. Save snapshot (if any)
-// 2. Save state and entries to storage
-// 3. Send messages to other nodes
-// 4. Apply snapshot to FSM (if any)
-// 5. Apply committed entries to FSM
+// processReady handles a single Raft Ready batch in the correct order
+// mandated by the etcd raft protocol:
+//  1. Update soft state and detect leader changes.
+//  2. Persist snapshot, hard state, and entries to WAL.
+//  3. Send outbound messages (MsgSnap must be sent before snapshot is applied).
+//  4. Apply snapshot to FSM (if present).
+//  5. Apply committed entries to FSM.
+//  6. Schedule a snapshot if the log has grown past the threshold.
+//  7. Call Advance to signal that this Ready has been fully processed.
 func (node *Node) processReady(ctx context.Context, rd *raft.Ready) error {
 	// node.updateCommittedIndex(rd)
 	// node.setTerm(rd.Term)
@@ -300,6 +330,10 @@ func (node *Node) processReady(ctx context.Context, rd *raft.Ready) error {
 	return nil
 }
 
+// scheduleSelfRemoval handles a ConfChange that removes this node from the
+// cluster. It sets the selfRemoved flag, gives outstanding work a 1-second
+// grace period, fires the onRemovedSelf callback, and then signals the ready
+// loop to stop.
 func (node *Node) scheduleSelfRemoval() {
 	node.log.Info("I've been removed from the cluster! Shutting down.")
 	node.setSelfRemoved(true)
@@ -313,6 +347,9 @@ func (node *Node) scheduleSelfRemoval() {
 	node.stopNotifier <- struct{}{}
 }
 
+// handleLeaderChange updates the cached leader ID and invokes the
+// onLeaderChange callback when the Raft leader changes. No-ops when the
+// leader is unchanged.
 func (node *Node) handleLeaderChange(ctx context.Context, newLeader uint64) {
 	// Update local state and invoke hook. Avoid repeating if unchanged.
 	if newLeader == node.getLead() {
@@ -326,6 +363,10 @@ func (node *Node) handleLeaderChange(ctx context.Context, newLeader uint64) {
 	}
 }
 
+// respondToReadStates attempts to satisfy pending linearizable-read waits by
+// forwarding read states whose confirmed index is at or below the current
+// applied index onto readStatesNotifier. Returns the slice of read states
+// that could not yet be satisfied.
 func (node *Node) respondToReadStates(readStates []raft.ReadState) []raft.ReadState {
 	if len(readStates) == 0 {
 		return []raft.ReadState{}
@@ -361,6 +402,10 @@ func (node *Node) respondToReadStates(readStates []raft.ReadState) []raft.ReadSt
 // 	}
 // }
 
+// applySnapshotToFSM restores the FSM from a Raft snapshot and advances the
+// applied index and confState to match the snapshot metadata. No-ops on an
+// empty snapshot or a snapshot that is not newer than the current applied
+// index.
 func (node *Node) applySnapshotToFSM(ctx context.Context, snapshot raftpb.Snapshot) error {
 	if raft.IsEmptySnap(snapshot) {
 		return nil
@@ -385,9 +430,10 @@ func (node *Node) applySnapshotToFSM(ctx context.Context, snapshot raftpb.Snapsh
 	return nil
 }
 
-// When there is a `raftpb.EntryConfChange` after creating the snapshot,
-// then the confState included in the snapshot is out of date. so We need
-// to update the confState before sending a snapshot to a follower.
+// getMessagesToPublish returns the outbound messages from rd with the current
+// confState patched into any MsgSnap entries. This is required because a
+// ConfChange committed after the snapshot was created makes the snapshot's
+// embedded confState stale; the follower must receive the up-to-date one.
 func (node *Node) getMessagesToPublish(rd *raft.Ready) []raftpb.Message {
 	confState := node.getConfState()
 	msgs := make([]raftpb.Message, 0, len(rd.Messages))
@@ -400,6 +446,9 @@ func (node *Node) getMessagesToPublish(rd *raft.Ready) []raftpb.Message {
 	return msgs
 }
 
+// getEntriesToApply filters committedEntries to the subset that has not been
+// applied yet (index > appliedIndex). Panics if there is a gap between the
+// first committed entry and the expected next index.
 func (node *Node) getEntriesToApply(committedEntries []raftpb.Entry) []raftpb.Entry {
 	if len(committedEntries) == 0 {
 		return committedEntries
@@ -418,6 +467,10 @@ func (node *Node) getEntriesToApply(committedEntries []raftpb.Entry) []raftpb.En
 	return []raftpb.Entry{}
 }
 
+// applyEntries applies each entry in order, dispatching normal entries to
+// applyNormalEntry and configuration changes to applyConfChange. Advances
+// appliedIndex after all entries are processed. Returns (true, nil) when a
+// ConfChange removes this node from the cluster.
 func (node *Node) applyEntries(ctx context.Context, entries []raftpb.Entry) (bool, error) {
 	selfRemove := false
 	publishedEntries := 0
@@ -447,6 +500,9 @@ func (node *Node) applyEntries(ctx context.Context, entries []raftpb.Entry) (boo
 	return selfRemove, nil
 }
 
+// applyNormalEntry decodes and applies a single committed data entry to the
+// FSM. Skips entries whose index is at or below the current applied index
+// (already applied, typically after a snapshot restore).
 func (node *Node) applyNormalEntry(ctx context.Context, entry raftpb.Entry) error {
 	appliedIndex := node.getAppliedIndex()
 	if entry.Index <= appliedIndex {
@@ -462,6 +518,10 @@ func (node *Node) applyNormalEntry(ctx context.Context, entry raftpb.Entry) erro
 	return nil
 }
 
+// applyConfChange processes a membership configuration change. It applies
+// the change to the Raft internal state, updates the local confState, and
+// adds or removes the affected peer from the transport. Returns (true, nil)
+// when the change removes this node from the cluster.
 func (node *Node) applyConfChange(ctx context.Context, entry raftpb.Entry) (bool, error) {
 	var cc raftpb.ConfChange
 	if err := cc.Unmarshal(entry.Data); err != nil {
@@ -495,19 +555,17 @@ func (node *Node) applyConfChange(ctx context.Context, entry raftpb.Entry) (bool
 	return false, nil
 }
 
-// Leader                                    Follower
-// ──────                                    ────────
-// takeSnapshotIfNeeded()                    receives MsgSnap
+// takeSnapshotIfNeeded creates a Raft snapshot when the number of committed
+// entries since the last snapshot exceeds defaultSnapshotCount, or when
+// force is true. The snapshot flow is:
 //
-//	FSM.CreateSnapshot()          ──────>   processReady()
-//	storage.CreateSnapshot()                  storage.SaveState()  (saves incoming snap)
-//	  wal.SaveSnap()                           transport.Send()
-//	  memStorage.Compact()                     FSM.RestoreSnapshot()
-//	                                           n.Advance()
-//
-// processReady()
-//
-//	getMessagesToPublish()        ──────>   injects current confState into MsgSnap
+//	Leader side                           Follower side
+//	──────────────────────────            ─────────────────────────────────
+//	FSM.CreateSnapshot()         ──────>  processReady()
+//	storage.CreateSnapshot()               storage.SaveState()  (persist snap)
+//	  wal.SaveSnap()                        transport.Send()
+//	  memStorage.Compact()                  FSM.RestoreSnapshot()
+//	getMessagesToPublish()        ──────>  patches confState into MsgSnap
 //	transport.Send(MsgSnap)
 func (node *Node) takeSnapshotIfNeeded(ctx context.Context, force bool) {
 	confState := node.getConfState()
@@ -535,16 +593,21 @@ func (node *Node) takeSnapshotIfNeeded(ctx context.Context, force bool) {
 	node.log.Info("Snapshot created successfully at index", zap.Uint64("appliedIndex", appliedIndex))
 }
 
+// IsLeader reports whether this node is the current Raft leader.
 func (node *Node) IsLeader() bool {
 	return node.getLead() == node.id
 }
 
-// Leader returns the current leader ID
+// Leader returns the node ID of the current Raft leader, or 0 if no leader
+// has been elected yet.
 func (node *Node) Leader() uint64 {
 	return node.getLead()
 }
 
-// ReadIndex requests a read index for linearizable reads
+// ReadIndex sends a MsgReadIndex to the Raft leader and returns the current
+// applied index once the cluster confirms this node is not stale. Callers
+// must then wait (via WaitForReadState) until the applied index reaches the
+// returned value before serving the read.
 func (node *Node) ReadIndex(ctx context.Context, rctx []byte) (uint64, error) {
 	err := node.n.ReadIndex(ctx, rctx)
 	if err != nil {
@@ -553,7 +616,9 @@ func (node *Node) ReadIndex(ctx context.Context, rctx []byte) (uint64, error) {
 	return node.getAppliedIndex(), nil
 }
 
-// WaitForReadState waits for a read state with timeout
+// WaitForReadState blocks until a ReadState is delivered on the
+// readStatesNotifier channel or timeout elapses. Used in the linearizable
+// read path after ReadIndex to confirm the applied index has caught up.
 func (node *Node) WaitForReadState(ctx context.Context, timeout time.Duration) (*raft.ReadState, error) {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -568,20 +633,26 @@ func (node *Node) WaitForReadState(ctx context.Context, timeout time.Duration) (
 	}
 }
 
+// ProposeReqNotifier returns the send-only channel used to submit proposals
+// to the proposeHandler goroutine.
 func (node *Node) ProposeReqNotifier() chan<- propose {
 	return node.proposeReqNotifier
 }
 
+// ProposeRespNotifier returns the receive-only channel on which the
+// proposeHandler delivers proposal results back to the caller.
 func (node *Node) ProposeRespNotifier() <-chan propose {
 	return node.proposeRespNotifier
 }
 
+// setAppliedIndex atomically stores the highest log index applied to the FSM.
 func (node *Node) setAppliedIndex(v uint64) {
 	node.log.Debug("Setting applied index",
 		zap.Uint64("oldIndex", node.getAppliedIndex()), zap.Uint64("newIndex", v))
 	node.appliedIndex.Store(v)
 }
 
+// getAppliedIndex returns the highest log index that has been applied to the FSM.
 func (node *Node) getAppliedIndex() uint64 {
 	return node.appliedIndex.Load()
 }
@@ -606,26 +677,33 @@ func (node *Node) getAppliedIndex() uint64 {
 // 	return node.term.Load()
 // }
 
+// setLead atomically stores the current leader's node ID.
 func (node *Node) setLead(v uint64) {
 	node.log.Debug("Setting Lead",
 		zap.Uint64("oldLead", node.getLead()), zap.Uint64("newLead", v))
 	node.lead.Store(v)
 }
 
+// getLead returns the current leader's node ID.
 func (node *Node) getLead() uint64 {
 	return node.lead.Load()
 }
 
+// setSelfRemoved atomically marks whether this node has been removed from
+// the cluster. Once true, the node stops processing new requests.
 func (node *Node) setSelfRemoved(v bool) {
 	node.log.Debug("Setting selfRemoved",
 		zap.Bool("oldValue", node.selfRemoved.Load()), zap.Bool("newValue", v))
 	node.selfRemoved.Store(v)
 }
 
+// getSelfRemoved reports whether this node has been removed from the cluster.
 func (node *Node) getSelfRemoved() bool {
 	return node.selfRemoved.Load()
 }
 
+// setConfState stores the current Raft cluster configuration state under the
+// confStateMu write lock.
 func (node *Node) setConfState(confState raftpb.ConfState) {
 	node.confStateMu.Lock()
 	node.log.Debug("Setting ConfState",
@@ -635,20 +713,29 @@ func (node *Node) setConfState(confState raftpb.ConfState) {
 	node.confStateMu.Unlock()
 }
 
+// getConfState returns the current Raft cluster configuration state under
+// the confStateMu read lock.
 func (node *Node) getConfState() raftpb.ConfState {
 	node.confStateMu.RLock()
 	defer node.confStateMu.RUnlock()
 	return node.confState
 }
 
+// WithLeaderChangeHook registers a callback that is invoked whenever the
+// Raft leader changes. prevLeader and newLeader are the old and new leader
+// node IDs respectively (0 means no leader).
 func (node *Node) WithLeaderChangeHook(hook func(ctx context.Context, prevLeader, newLeader uint64)) {
 	node.onLeaderChange = hook
 }
 
+// WithRemovedSelfHook registers a callback that is invoked when a
+// ConfChange removes this node from the cluster.
 func (node *Node) WithRemovedSelfHook(hook func()) {
 	node.onRemovedSelf = hook
 }
 
+// Stop shuts down the peer transport and signals the ready and propose
+// handler goroutines to exit.
 func (node *Node) Stop(ctx context.Context) {
 	node.log.Info("Stopping transport for raft node")
 	err := node.transport.Stop()
@@ -666,18 +753,26 @@ func (node *Node) Stop(ctx context.Context) {
 	node.log.Info("Raft node stopped")
 }
 
+// Process implements rafthttp.Raft. It delivers an inbound Raft message
+// received from a peer into the local Raft state machine.
 func (node *Node) Process(ctx context.Context, m raftpb.Message) error {
 	return node.n.Step(ctx, m)
 }
 
+// IsIDRemoved implements rafthttp.Raft. It reports whether the node with the
+// given id has been removed from the cluster.
 func (node *Node) IsIDRemoved(id uint64) bool {
 	return node.cluster.IsNodeRemoved(id)
 }
 
+// ReportUnreachable implements rafthttp.Raft. It notifies the Raft state
+// machine that the node with the given id is temporarily unreachable.
 func (node *Node) ReportUnreachable(id uint64) {
 	node.n.ReportUnreachable(id)
 }
 
+// ReportSnapshot implements rafthttp.Raft. It reports the outcome of a
+// snapshot send to the node identified by id.
 func (node *Node) ReportSnapshot(id uint64, status raft.SnapshotStatus) {
 	node.n.ReportSnapshot(id, status)
 }

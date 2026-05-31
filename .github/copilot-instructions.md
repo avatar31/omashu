@@ -73,7 +73,7 @@ Your Application
 | `tso.go` | `*TSO` | Timestamp Oracle: hybrid logical clock (HLC), in-flight read tracking, conflict detection, GC watermarks |
 | `txn.go` | `*Txn`, `*TxnManager` | Transaction lifecycle: `BeginTxn` (assigns `readTs`), write buffering, `Commit` (assigns `commitTs`, conflict check, proposes to Raft), `Discard` |
 | `transport.go` | `*Transport` | HTTP peer transport using `etcd/rafthttp`; serves and dials peer nodes |
-| `replication.go` | `*Replicate` | Full-database snapshot via BadgerDB `Backup`/`Load` for Raft snapshot transfer |
+| `replication.go` | `*Replicate`, `Replicator` | Full-database snapshot via BadgerDB `Backup`/`Load` for Raft snapshot transfer; the exported `Replicator` interface defines `TakeSnapshot`/`Restore` so the FSM can swap implementations |
 | `storage.go` | `*Storage` | Bridges `raft.MemoryStorage`, WAL, and Snapshotter; `SaveState`, `Initialize` |
 | `wal.go` | `*Wal` | Wraps etcd WAL and Snapshotter; handles open/replay/save/snapshot |
 | `config.go` | `Config`, `RaftConfig`, `SchemaConfig` | Config struct, `Cluster` interface, validation logic |
@@ -140,6 +140,19 @@ Transactions use **Snapshot Isolation** enforced by the TSO:
 5. FSM applies the entry to BadgerDB at `commitTs` on all nodes
 
 **Important:** Only the Raft **leader** accepts write transactions. Non-leader writes return `ErrNotLeader`.
+
+### Internal Proposal Pipeline (DistributedBadger)
+
+Single write operation path:
+
+```
+proposeTxnSubCommand → BeginTxn → performOps → Commit → proposeAndWait
+```
+
+1. `proposeTxnSubCommand` opens a `Txn`, runs the write op, calls `Txn.Commit` to assign `commitTs`, then passes the encoded command to `proposeAndWait`
+2. `proposeAndWait` stores an `errCh` in `proposals` (`sync.Map`) keyed by `cmdID`, sends `propose{cmdID, cmd}` to `node.ProposeReqNotifier()`, and blocks up to `DefaultProposeTimeout`
+3. `listenProposeResponses` goroutine (one per leadership term, started in `onLeaderChange`) reads from `node.ProposeRespNotifier()` and routes each result to the matching `errCh`
+4. On leader loss, `leaderChangeNotifier` channel is closed, stopping `listenProposeResponses` and draining any pending proposals with `ErrNotLeader`
 
 ---
 
@@ -235,6 +248,23 @@ type Cluster interface {
 
 ---
 
+## Key Constants
+
+| Constant | Value | Description |
+|---|---|---|
+| `MaxBatchSize` | `100` | Max sub-commands per `Txn.Commit`; checked in `Txn.Commit` before proposing to Raft |
+| `DefaultProposeTimeout` | `5 * time.Second` | Raft proposal deadline in `proposeAndWait`; returns `ErrProposeTimeout` on expiry |
+| `RetryCount` | `5` | Max retry attempts for recoverable node operations |
+| `ReadStatesTimeout` | `1 * time.Second` | Per-ReadIndex wait deadline; `waitForReadState` in `distributed.go` passes `5s` |
+| `defaultSnapshotCount` | `100000` | Log entries between automatic snapshots (`takeSnapshotIfNeeded` in `node.go`) |
+| `LOGICAL_BITS` | `18` | Bits for logical counter in HLC timestamp |
+| `MAX_LOGICAL` | `262143` | Max logical ticks per millisecond (`1<<18 - 1`) |
+| `defaultUpperBoundWindow` | `2 * time.Second` | How often TSO persists its upper-bound timestamp to BadgerDB key `_tso_last_timestamp` |
+| `maxRestorePendingTxns` | `256` | BadgerDB snapshot restore pipeline depth (`replication.go`) |
+| `defaultReqTimeout` | `5 * time.Second` | HTTP server request timeout in `transport.go` |
+
+---
+
 ## Build & Test Commands
 
 ```bash
@@ -314,6 +344,9 @@ Test fixtures live in `assets/fixtures.json`. Tests use an in-memory BadgerDB in
 ## Documentation
 
 - **README** — [README.md](../README.md): full API reference, usage examples, architecture diagram, config reference, error table
+- **Inline API docs** — godoc comments on every exported (and most unexported) symbol across all source files; visible on [pkg.go.dev/github.com/avatar31/omashu](https://pkg.go.dev/github.com/avatar31/omashu) after publishing
+- **AI assistant reference** — `.github/copilot-instructions.md` (this file): complete architecture, design rationale, constants table, active TODOs
+- **AI operational guidelines** — `AGENTS.md`: coding conventions, common workflows, file sensitivity tiers, known pitfalls
 - **Notes/Design** — `notes.md`: reference links for Raft design; TSO architecture discussion
 - **Roadmap** — `roadmap.md`: feature planning
 - **Review notes** — `review.md`, `tso_notes.md`, `snapshot.md`, `transport_err_fix.md`, `ut.md`, `testing.md`: engineering decision logs and review threads

@@ -23,6 +23,9 @@ import (
 	"github.com/avatar31/omashu/utils"
 )
 
+// Wal wraps etcd's WAL and Snapshotter to provide durable storage for Raft
+// hard state, log entries, and snapshots. All exported methods are
+// goroutine-safe.
 type Wal struct {
 	waldir      string
 	snapdir     string
@@ -34,6 +37,9 @@ type Wal struct {
 	mu  sync.RWMutex
 }
 
+// newWal creates a Wal rooted at baseDir. It creates the wal/ and snap/
+// subdirectories if they do not already exist and removes any leftover
+// temporary snapshot files from a previous crash.
 func newWal(baseDir string, log *zap.Logger) (*Wal, error) {
 	waldir := filepath.Join(baseDir, "wal")
 	if err := utils.CreateDirIfNotExists(waldir); err != nil {
@@ -63,6 +69,10 @@ func newWal(baseDir string, log *zap.Logger) (*Wal, error) {
 	}, nil
 }
 
+// Open initialises the snapshotter, loads the most recent valid snapshot,
+// opens (or creates) the WAL, reads all persisted hard state and log entries,
+// and returns them to the caller for replay into memory storage. It must be
+// called exactly once before any other Wal method.
 func (w *Wal) Open(ctx context.Context) (*raftpb.Snapshot, *raftpb.HardState, []raftpb.Entry, error) {
 	w.snapshotter = snap.New(w.log, w.snapdir)
 	snapshot, err := w.loadLatestSnapshot()
@@ -91,6 +101,9 @@ func (w *Wal) Open(ctx context.Context) (*raftpb.Snapshot, *raftpb.HardState, []
 	return snapshot, &hardState, entries, nil
 }
 
+// loadLatestSnapshot finds the newest snapshot file that has a matching WAL
+// snapshot entry. Orphaned snapshot files (written after a crash before the
+// WAL entry was appended) are silently skipped.
 func (w *Wal) loadLatestSnapshot() (*raftpb.Snapshot, error) {
 	if !wal.Exist(w.waldir) {
 		w.log.Info("WAL does not exist, starting fresh")
@@ -115,6 +128,9 @@ func (w *Wal) loadLatestSnapshot() (*raftpb.Snapshot, error) {
 	return snapshot, nil
 }
 
+// openWAL opens an existing WAL starting from the given snapshot position,
+// or creates a new empty WAL if none exists. A create/close cycle is used
+// to initialise the WAL directory the first time.
 func (w *Wal) openWAL(snapshot *raftpb.Snapshot) (*wal.WAL, error) {
 	if !wal.Exist(w.waldir) {
 		walInt, err := wal.Create(w.log, w.waldir, nil)
@@ -141,6 +157,9 @@ func (w *Wal) openWAL(snapshot *raftpb.Snapshot) (*wal.WAL, error) {
 	return walInt, nil
 }
 
+// SaveState appends hard state and log entries to the WAL. Must be called
+// before advancing the Raft state machine so that the persisted log always
+// leads or matches the applied index.
 func (w *Wal) SaveState(hardState raftpb.HardState, entries []raftpb.Entry) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -152,6 +171,10 @@ func (w *Wal) SaveState(hardState raftpb.HardState, entries []raftpb.Entry) erro
 	return nil
 }
 
+// SaveSnap persists a Raft snapshot. The snapshot file is written before the
+// WAL snapshot entry so that a crash between the two produces an orphaned
+// (recoverable) snapshot file rather than a WAL entry with no corresponding
+// file (unrecoverable).
 func (w *Wal) SaveSnap(snap *raftpb.Snapshot) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -177,6 +200,8 @@ func (w *Wal) SaveSnap(snap *raftpb.Snapshot) error {
 	return nil
 }
 
+// Release advances the WAL lock-release frontier to index, allowing the WAL
+// to free disk space for log entries older than that index.
 func (w *Wal) Release(index uint64) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -188,8 +213,11 @@ func (w *Wal) Release(index uint64) error {
 	return nil
 }
 
-// TODO: P1: Analyze impact of Sync
-// Because I am getting "bad file descriptor" error on calling w.wal.Close()
+// Sync flushes the WAL to disk. It must be called after SaveState and before
+// Release to ensure hard state is durable before compacted entries are freed.
+//
+// Note: a "bad file descriptor" error has been observed on subsequent
+// w.wal.Close() calls; root cause is under investigation (TODO P1).
 func (w *Wal) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -201,14 +229,18 @@ func (w *Wal) Sync() error {
 	return nil
 }
 
+// ExistingWAL reports whether a WAL directory existed before this Wal was
+// opened. The node uses this to choose between raft.StartNode (new member)
+// and raft.RestartNode (rejoining member).
 func (w *Wal) ExistingWAL() bool {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	return w.existingWAL
 }
 
-// Exists checks if WAL and snapshot directories exist and contain data
-// Used to determine if this is a new node or restarting node
+// Exists reports whether both the WAL directory and a valid snapshot file
+// exist on disk. Returns (walExists, snapExists, error); the only non-nil
+// error is an unexpected snapshotter failure (ErrNoSnapshot is swallowed).
 func (w *Wal) Exists() (walExists bool, snapExists bool, err error) {
 	// Check WAL existence
 	walExists = wal.Exist(w.waldir)
@@ -229,6 +261,8 @@ func (w *Wal) Exists() (walExists bool, snapExists bool, err error) {
 	return walExists, snapExists, err
 }
 
+// Close closes the underlying WAL file handle. Safe to call when no WAL has
+// been opened yet (returns nil in that case).
 func (w *Wal) Close() error {
 	if w.wal != nil {
 		return w.wal.Close()

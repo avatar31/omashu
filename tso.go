@@ -27,6 +27,12 @@ import (
 // https://github.com/tikv/pd/blob/master/pkg/tso/tso.go
 // https://github.com/dgraph-io/badger/blob/main/txn.go
 
+// LOGICAL_BITS is the number of bits reserved for the logical counter in a
+// hybrid logical clock timestamp. MAX_LOGICAL is the largest value that fits
+// in those bits (2^18-1 = 262143 timestamps per millisecond).
+// defaultUpperBoundWindow is how far ahead the TSO persists its upper bound
+// to BadgerDB, ensuring the next leader can advance safely. persistentKey is
+// the BadgerDB key used to store that upper bound.
 const (
 	LOGICAL_BITS            = 18
 	MAX_LOGICAL             = (1 << LOGICAL_BITS) - 1
@@ -61,6 +67,7 @@ type timeStamp struct {
 	logical  int64
 }
 
+// newEmptyTimeStamp allocates a zero-value timeStamp (physical=0, logical=0).
 func newEmptyTimeStamp() *timeStamp {
 	return &timeStamp{physical: 0, logical: 0}
 }
@@ -376,6 +383,8 @@ func (tso *TSO) CurrentReadTs() uint64 {
 	return tso.currentReadTs()
 }
 
+// currentReadTs returns the composed timestamp from the current HLC state.
+// Callers must hold tso.mu.
 func (tso *TSO) currentReadTs() uint64 {
 	return tso.current.Compose()
 }

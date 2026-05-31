@@ -31,11 +31,15 @@ type Replicator interface {
 	Restore(ctx context.Context, data []byte) error
 }
 
+// Replicate implements [Replicator] by streaming a full BadgerDB backup
+// into a bytes.Buffer (snapshot) and restoring it via BadgerDB's Load API.
 type Replicate struct {
 	db  *Badger
 	log *zap.Logger
 }
 
+// NewReplicator creates a [Replicator] backed by db. The returned value is
+// used by the FSM to produce and consume Raft snapshots.
 func NewReplicator(db *Badger, log *zap.Logger) (Replicator, error) {
 	return &Replicate{db: db, log: log}, nil
 }

@@ -56,6 +56,13 @@ import (
 // - Implement advanced data visualization and exploration tools for the DBStore
 // - Implement advanced data governance and compliance features for the DBStore
 
+// DefaultProposeTimeout is the maximum time [DistributedBadger.proposeAndWait]
+// blocks waiting for a Raft command to be committed before returning
+// [ErrProposeTimeout].
+//
+// DBSubDir, WALSubDir, and SnapSubDir are the subdirectory names created
+// under [Config.BaseDir] for BadgerDB data, the Raft WAL, and Raft
+// snapshots respectively.
 const (
 	DefaultProposeTimeout = 5 * time.Second
 
@@ -65,6 +72,9 @@ const (
 	SnapSubDir = "snap"
 )
 
+// initDistributed wires together the TSO, TxnManager, FSM, and Raft Node
+// for a distributed store instance. The TSO and TxnManager are not yet
+// serving timestamps — they activate when this node wins a leader election.
 func initDistributed(ctx context.Context, db *Badger, cfg *Config) (*DistributedBadger, error) {
 	instance := &DistributedBadger{
 		log:                cfg.Logger.With(zap.Uint64("nodeId", cfg.RaftConfig.ID)),
@@ -104,6 +114,10 @@ func initDistributed(ctx context.Context, db *Badger, cfg *Config) (*Distributed
 	return instance, nil
 }
 
+// onLeaderChange is invoked by the Raft node whenever the cluster leader
+// changes. On gaining leadership it starts the TSO and the proposal-response
+// listener. On losing leadership it shuts the TSO down and drains the
+// in-flight proposal channel.
 func (s *DistributedBadger) onLeaderChange(ctx context.Context, prevLeader, newLeader uint64) {
 	if newLeader == s.node.id {
 		s.log.Info("This node is now the leader, starting TSO server")
@@ -143,12 +157,18 @@ func (s *DistributedBadger) onLeaderChange(ctx context.Context, prevLeader, newL
 	}
 }
 
+// onRemovedSelf is invoked when a ConfChange removes this node from the
+// cluster. It fires the user-supplied OnRemovedSelf callback if one is set.
 func (s *DistributedBadger) onRemovedSelf() {
 	if s.onRemovedSelfHook != nil {
 		s.onRemovedSelfHook()
 	}
 }
 
+// listenProposeResponses receives completed proposal results from the Raft
+// node and routes each result to the waiting caller via the per-command
+// error channel stored in s.proposals. Runs for the duration of a single
+// leadership term; exits when ctx is cancelled or leadership is lost.
 func (s *DistributedBadger) listenProposeResponses(ctx context.Context) {
 	// Capture the notifier channel for THIS leadership term under a read-lock.
 	// onLeaderChange replaces s.leaderChangeNotifier with a fresh channel each
@@ -183,6 +203,11 @@ func (s *DistributedBadger) listenProposeResponses(ctx context.Context) {
 	}
 }
 
+// waitForReadState implements the linearizable-read protocol: it sends a
+// ReadIndex request to the Raft leader and then blocks until the local
+// applied index has caught up to the confirmed read index. After this
+// returns the caller can safely serve the read from the local BadgerDB
+// without risk of stale data.
 func (s *DistributedBadger) waitForReadState(ctx context.Context, key string) error {
 	var appliedIndex, rsIndex uint64
 	start := time.Now()
@@ -210,17 +235,20 @@ func (s *DistributedBadger) waitForReadState(ctx context.Context, key string) er
 	return nil
 }
 
-// isLeader returns true if this node is the leader
+// isLeader reports whether this node is the current Raft leader.
 func (s *DistributedBadger) isLeader() bool {
 	return s.node.IsLeader()
 }
 
 // DBReadOps Interface
 
+// Count returns the number of keys whose names begin with prefix.
 func (s *DistributedBadger) Count(ctx context.Context, prefix string) int {
 	return s.fsm.db.Count(ctx, prefix)
 }
 
+// Exists reports whether key is present in the store. It performs a
+// linearizable read check before querying the local BadgerDB instance.
 func (s *DistributedBadger) Exists(ctx context.Context, key string) bool {
 	if err := s.waitForReadState(ctx, key); err != nil {
 		return false
@@ -228,14 +256,21 @@ func (s *DistributedBadger) Exists(ctx context.Context, key string) bool {
 	return s.fsm.db.Exists(ctx, key)
 }
 
+// HasChild reports whether any key beginning with prefix exists in the store.
 func (s *DistributedBadger) HasChild(ctx context.Context, prefix string) bool {
 	return s.fsm.db.HasChild(ctx, prefix)
 }
 
+// Get performs a linearizable read and returns the value for key.
+// Returns (nil, false, nil) when the key does not exist.
 func (s *DistributedBadger) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	return s.getVal(ctx, key, false)
 }
 
+// getVal reads key from BadgerDB. When skipLinearizable is false it first
+// calls waitForReadState to guarantee a linearizable read. skipLinearizable
+// is set to true only for internal TSO reads that do not need read-index
+// confirmation.
 func (s *DistributedBadger) getVal(ctx context.Context, key string, skipLinearizable bool) ([]byte, bool, error) {
 	if !skipLinearizable {
 		if err := s.waitForReadState(ctx, key); err != nil {
@@ -245,6 +280,8 @@ func (s *DistributedBadger) getVal(ctx context.Context, key string, skipLineariz
 	return s.fsm.db.Get(ctx, key)
 }
 
+// GetWithTxn reads key at the transaction's read timestamp, records it as a
+// read key for conflict detection, and performs a linearizable read check.
 func (s *DistributedBadger) GetWithTxn(ctx context.Context, txn *Txn, key string) ([]byte, bool, error) {
 	if err := s.waitForReadState(ctx, key); err != nil {
 		return nil, false, err
@@ -258,10 +295,13 @@ func (s *DistributedBadger) GetWithTxn(ctx context.Context, txn *Txn, key string
 	return result, found, nil
 }
 
+// GetByPrefix returns all key-value pairs whose keys begin with prefix.
 func (s *DistributedBadger) GetByPrefix(ctx context.Context, prefix string) (map[string][]byte, error) {
 	return s.fsm.db.GetByPrefix(ctx, prefix)
 }
 
+// GetByPrefixWithTxn reads all keys matching prefix at the transaction's read
+// timestamp and registers each as a read key for conflict detection.
 func (s *DistributedBadger) GetByPrefixWithTxn(ctx context.Context, txn *Txn, prefix string) (map[string][]byte, error) {
 	result, err := s.fsm.db.getByPrefixAt(ctx, prefix, txn.readTs)
 	if err != nil {
@@ -274,10 +314,13 @@ func (s *DistributedBadger) GetByPrefixWithTxn(ctx context.Context, txn *Txn, pr
 	return result, nil
 }
 
+// GetKeysByPrefix returns all keys that begin with prefix.
 func (s *DistributedBadger) GetKeysByPrefix(ctx context.Context, prefix string) ([]string, error) {
 	return s.fsm.db.GetKeysByPrefix(ctx, prefix)
 }
 
+// GetKeysByPrefixWithTxn returns keys matching prefix at the transaction's
+// read timestamp and registers each for conflict detection.
 func (s *DistributedBadger) GetKeysByPrefixWithTxn(ctx context.Context, txn *Txn, prefix string) ([]string, error) {
 	keys, err := s.fsm.db.getKeysByPrefixAt(ctx, prefix, txn.readTs)
 	if err != nil {
@@ -290,10 +333,14 @@ func (s *DistributedBadger) GetKeysByPrefixWithTxn(ctx context.Context, txn *Txn
 	return keys, nil
 }
 
+// BulkGet fetches multiple keys in a single BadgerDB read transaction.
+// Missing keys are omitted from the returned map.
 func (s *DistributedBadger) BulkGet(ctx context.Context, keys []string) (map[string][]byte, error) {
 	return s.fsm.db.BulkGet(ctx, keys)
 }
 
+// IterateByPrefix is a paginated prefix scan. See [Badger.IterateByPrefix]
+// for the full contract on startCursor, limit, and the process callback.
 func (s *DistributedBadger) IterateByPrefix(ctx context.Context, prefix, startCursor string, limit *int,
 	process func(k, v []byte) bool) (string, error) {
 	return s.fsm.db.IterateByPrefix(ctx, prefix, startCursor, limit, process)
@@ -301,6 +348,8 @@ func (s *DistributedBadger) IterateByPrefix(ctx context.Context, prefix, startCu
 
 // DBWriteOps Interface
 
+// DecrBy decrements the counter at key by delta. Returns [ErrNotLeader] if
+// this node is not the current Raft leader.
 func (s *DistributedBadger) DecrBy(ctx context.Context, key string, delta uint64) error {
 	if !s.isLeader() {
 		return ErrNotLeader
@@ -311,10 +360,14 @@ func (s *DistributedBadger) DecrBy(ctx context.Context, key string, delta uint64
 	})
 }
 
+// DecrByWithTxn buffers a DECR_BY sub-command on txn. The decrement is
+// applied when the transaction commits.
 func (s *DistributedBadger) DecrByWithTxn(ctx context.Context, txn *Txn, key string, delta uint64) error {
 	return txn.DecrBy(ctx, key, delta)
 }
 
+// IncrBy increments the counter at key by delta. Returns [ErrNotLeader] if
+// this node is not the current Raft leader.
 func (s *DistributedBadger) IncrBy(ctx context.Context, key string, delta uint64) error {
 	if !s.isLeader() {
 		return ErrNotLeader
@@ -325,10 +378,14 @@ func (s *DistributedBadger) IncrBy(ctx context.Context, key string, delta uint64
 	})
 }
 
+// IncrByWithTxn buffers an INCR_BY sub-command on txn. The increment is
+// applied when the transaction commits.
 func (s *DistributedBadger) IncrByWithTxn(ctx context.Context, txn *Txn, key string, delta uint64) error {
 	return txn.IncrBy(ctx, key, delta)
 }
 
+// Set stores value at key with optional TTL. Returns [ErrNotLeader] if this
+// node is not the current Raft leader.
 func (s *DistributedBadger) Set(ctx context.Context, key string, value []byte, ttl ...time.Duration) error {
 	if !s.isLeader() {
 		return ErrNotLeader
@@ -339,10 +396,14 @@ func (s *DistributedBadger) Set(ctx context.Context, key string, value []byte, t
 	})
 }
 
+// SetWithTxn buffers a SET sub-command on txn. The write is applied when
+// the transaction commits.
 func (s *DistributedBadger) SetWithTxn(ctx context.Context, txn *Txn, key string, value []byte, ttl ...time.Duration) error {
 	return txn.Set(ctx, key, value, ttl...)
 }
 
+// UpdateJson merges the JSON delta map into the existing value at key.
+// Returns [ErrNotLeader] if this node is not the current Raft leader.
 func (s *DistributedBadger) UpdateJson(ctx context.Context, key string, delta map[string]any, ttl ...time.Duration) error {
 	if !s.isLeader() {
 		return ErrNotLeader
@@ -353,11 +414,17 @@ func (s *DistributedBadger) UpdateJson(ctx context.Context, key string, delta ma
 	})
 }
 
+// UpdateJsonWithTxn buffers a JSON UPDATE sub-command on txn. The merge is
+// applied when the transaction commits.
 func (s *DistributedBadger) UpdateJsonWithTxn(ctx context.Context, txn *Txn, key string, delta map[string]any,
 	ttl ...time.Duration) error {
 	return txn.UpdateJson(ctx, key, delta, ttl...)
 }
 
+// UpdateProtobuf merges the Protobuf delta message into the existing value at
+// key. Returns [ErrNotLeader] if this node is not the current Raft leader.
+// Returns [ErrUnknownProtoMsg] if the message type is not registered in the
+// descriptor store.
 func (s *DistributedBadger) UpdateProtobuf(ctx context.Context, key string, delta proto.Message,
 	ttl ...time.Duration) error {
 	if !s.isLeader() {
@@ -373,6 +440,8 @@ func (s *DistributedBadger) UpdateProtobuf(ctx context.Context, key string, delt
 	})
 }
 
+// UpdateProtobufWithTxn buffers a Protobuf UPDATE sub-command on txn. The
+// field-level merge is applied when the transaction commits.
 func (s *DistributedBadger) UpdateProtobufWithTxn(ctx context.Context, txn *Txn, key string, delta proto.Message,
 	ttl ...time.Duration) error {
 	return txn.UpdateProtobuf(ctx, key, delta, ttl...)
@@ -380,6 +449,8 @@ func (s *DistributedBadger) UpdateProtobufWithTxn(ctx context.Context, txn *Txn,
 
 // DBDeleteOps Interface
 
+// Delete removes key from the store. Returns [ErrNotLeader] if this node is
+// not the current Raft leader. A missing key is a successful no-op.
 func (s *DistributedBadger) Delete(ctx context.Context, key string) error {
 	if !s.isLeader() {
 		return ErrNotLeader
@@ -390,10 +461,14 @@ func (s *DistributedBadger) Delete(ctx context.Context, key string) error {
 	})
 }
 
+// DeleteWithTxn buffers a DELETE sub-command on txn. The deletion is applied
+// when the transaction commits.
 func (s *DistributedBadger) DeleteWithTxn(ctx context.Context, txn *Txn, key string) error {
 	return txn.Delete(ctx, key)
 }
 
+// DeleteByPrefix removes all keys that begin with prefix. Returns
+// [ErrNotLeader] if this node is not the current Raft leader.
 func (s *DistributedBadger) DeleteByPrefix(ctx context.Context, prefix string) error {
 	if !s.isLeader() {
 		return ErrNotLeader
@@ -404,16 +479,26 @@ func (s *DistributedBadger) DeleteByPrefix(ctx context.Context, prefix string) e
 	})
 }
 
+// DeleteByPrefixWithTxn buffers a DELETE_BY_PREFIX sub-command on txn. All
+// matching keys are removed when the transaction commits.
 func (s *DistributedBadger) DeleteByPrefixWithTxn(ctx context.Context, txn *Txn, prefix string) error {
 	return txn.DeleteByPrefix(ctx, prefix)
 }
 
 // Database Interface
 
+// GetBadger exposes the underlying BadgerDB instance for advanced use cases
+// such as streaming backups. Mutations made directly on BadgerDB bypass the
+// Raft log and will cause divergence between cluster nodes.
 func (s *DistributedBadger) GetBadger() *badger.DB {
 	return s.fsm.db.GetBadger()
 }
 
+// NewTransaction executes performOps inside a fully serialisable transaction
+// with snapshot isolation. The transaction is committed via Raft after
+// performOps returns nil; any conflict detected during commit causes the
+// whole transaction to be discarded. Returns [ErrNotLeader] if this node is
+// not the current Raft leader.
 func (s *DistributedBadger) NewTransaction(ctx context.Context, performOps func(context.Context, *Txn) error) error {
 	if !s.isLeader() {
 		return ErrNotLeader
@@ -445,6 +530,8 @@ func (s *DistributedBadger) NewTransaction(ctx context.Context, performOps func(
 	return s.proposeAndWait(cmd)
 }
 
+// Close shuts down the TSO, the Raft node, and the FSM in dependency order.
+// Safe to call even if initDistributed did not complete successfully.
 func (s *DistributedBadger) Close(ctx context.Context) {
 	if s.tso != nil {
 		s.tso.Close()
@@ -461,6 +548,10 @@ func (s *DistributedBadger) Close(ctx context.Context) {
 
 // Helpers
 
+// proposeTxnSubCommand is a convenience wrapper used by single-operation
+// write and delete methods. It opens a transaction, runs performOps to
+// buffer exactly one sub-command, commits the transaction to obtain a
+// commit timestamp, and proposes the command to Raft.
 func (s *DistributedBadger) proposeTxnSubCommand(ctx context.Context, performOps func(context.Context, *Txn) error) error {
 	txn, err := s.tm.BeginTxn(ctx, true)
 	if err != nil {
@@ -493,6 +584,9 @@ func (s *DistributedBadger) proposeTxnSubCommand(ctx context.Context, performOps
 	return s.proposeAndWait(cmd)
 }
 
+// proposeAndWait serialises cmd, enqueues it on the Raft proposal channel,
+// and blocks until the command is committed and applied or
+// [DefaultProposeTimeout] elapses.
 func (s *DistributedBadger) proposeAndWait(cmd *types.Command) error {
 	b, err := cmd.Encode()
 	if err != nil {

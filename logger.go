@@ -12,10 +12,16 @@ import (
 	"go.uber.org/zap"
 )
 
+// newLogger creates a [raft.Logger] adapter backed by log.
+// module is attached as a "subModule" field on every log entry,
+// making it easy to filter Raft library output in production logs.
 func newLogger(module string, log *zap.Logger) raft.Logger {
 	return &zapRaftLogger{log: log.With(zap.String("subModule", module))}
 }
 
+// zapRaftLogger bridges go.uber.org/zap to the [raft.Logger] interface
+// used by the etcd/raft state machine. Every level delegates directly
+// to the corresponding zap method (no format string buffering).
 type zapRaftLogger struct {
 	log *zap.Logger
 }
