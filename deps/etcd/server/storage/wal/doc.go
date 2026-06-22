@@ -72,3 +72,7 @@ This will give you the metadata, the last raft.State and the slice of
 raft.Entry items in the log.
 */
 package wal
+
+const (
+	LocalCodebaseMarker = "v3.6.8-custom"
+)

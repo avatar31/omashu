@@ -2,6 +2,13 @@ module github.com/avatar31/omashu
 
 go 1.26.1
 
+replace (
+	go.etcd.io/etcd/api/v3 => ./deps/etcd/api
+	go.etcd.io/etcd/client/pkg/v3 => ./deps/etcd/client/pkg
+	go.etcd.io/etcd/pkg/v3 => ./deps/etcd/pkg
+	go.etcd.io/etcd/server/v3 => ./deps/etcd/server
+)
+
 require (
 	github.com/dgraph-io/badger/v4 v4.9.1
 	github.com/dgraph-io/ristretto/v2 v2.4.0

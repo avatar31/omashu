@@ -14,3 +14,7 @@
 
 // Package rafthttp implements HTTP transportation layer for raft pkg.
 package rafthttp
+
+const (
+	LocalCodebaseMarker = "v3.6.8-custom"
+)
