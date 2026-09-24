@@ -56,19 +56,18 @@ import (
 // - Implement advanced data visualization and exploration tools for the DBStore
 // - Implement advanced data governance and compliance features for the DBStore
 
-// DefaultProposeTimeout is the maximum time [DistributedBadger.proposeAndWait]
-// blocks waiting for a Raft command to be committed before returning
-// [ErrProposeTimeout].
-//
-// DBSubDir, WALSubDir, and SnapSubDir are the subdirectory names created
-// under [Config.BaseDir] for BadgerDB data, the Raft WAL, and Raft
-// snapshots respectively.
 const (
+	// DefaultProposeTimeout is the maximum time [DistributedBadger.proposeAndWait]
+	// blocks waiting for a Raft command to be committed before returning [ErrProposeTimeout].
 	DefaultProposeTimeout = 5 * time.Second
 
-	// Subdirectories for different components of the store
+	// Subdirectory for created under [Config.BaseDir] for BadgerDB data
 	DBSubDir   = "db"
+
+	// Subdirectory for created under [Config.BaseDir] for Raft WAL
 	WALSubDir  = "wal"
+
+	// Subdirectory for created under [Config.BaseDir] for Raft snapshots
 	SnapSubDir = "snap"
 )
 

@@ -61,6 +61,9 @@ Your Application
                  (BadgerDB MVCC)
 ```
 
+### etcd dependency
+`deps/etcd` is a vendored copy of `go.etcd.io/etcd@v3.6.8`(git clone --branch v3.6.8 https://github.com/etcd-io/etcd.git deps/etcd) that contains the `rafthttp` for transport, `wal`, and `snap` packages. It is used instead of the upstream module. This is because these packages are internal to `etcd` and not exported, so etcd can make breaking changes without a major version bump. By vendoring, we can control when to pull in updates and ensure stability.
+
 ### Component Responsibilities
 
 | File | Type | Responsibility |

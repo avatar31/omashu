@@ -2,9 +2,10 @@
 
 > A distributed, transactional key-value store for Go — built on BadgerDB and etcd/raft.
 
-[![Go Version](https://img.shields.io/badge/go-1.26+-00ADD8?logo=go)](https://go.dev)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
-[![Module](https://img.shields.io/badge/module-github.com%2Favatar31%2Fomashu-informational)](https://pkg.go.dev/github.com/avatar31/omashu)
+[![](https://img.shields.io/github/v/tag/avatar31/omashu?color=369eff\&labelColor=black\&logo=github\&style=flat-square)](https://github.com/avatar31/omashu/releases)
+[![](https://img.shields.io/github/issues/avatar31/omashu?labelColor=black\&style=flat-square\&color=ff80eb)](https://github.com/avatar31/omashu/issues)
+[![](https://img.shields.io/badge/license-Apache%202.0-white?labelColor=black\&style=flat-square)](LICENSE)
+[![](https://img.shields.io/github/last-commit/avatar31/omashu?color=c4f042\&labelColor=black\&style=flat-square)](https://github.com/avatar31/omashu/commits/main)
 
 ## Why This Exists
 
